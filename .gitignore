@@ -1,0 +1,6 @@
+# Upstream clone and scratch trees
+/work/
+
+# Patch application leftovers
+*.orig
+*.rej
