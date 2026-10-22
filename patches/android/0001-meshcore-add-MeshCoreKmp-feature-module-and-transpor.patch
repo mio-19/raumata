@@ -1,0 +1,813 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mio <mio@mio19.uk>
+Date: Thu, 22 Oct 2026 23:17:36 +1100
+Subject: [PATCH] meshcore: add MeshCoreKmp feature module and transports
+
+Add a dedicated feature module backed by com.darkrockstudios:meshcore. BLE uses MeshCoreKmp's BlueFalcon adapter; USB is exposed through the same BleAdapter interface using the app's UsbRepository, with MeshCore's USB CDC <\u003e framing handled by UsbMeshCoreConnection. The module is registered with Koin and kept independent of the Meshtastic node/message data.
+
+diff --git a/androidApp/build.gradle.kts b/androidApp/build.gradle.kts
+index 0e4ed76cf4630e83cf6ff3c45b6c4644dab7d4b0..fff86886fbc436065433715012eb231acbd3de05 100644
+--- a/androidApp/build.gradle.kts
++++ b/androidApp/build.gradle.kts
+@@ -213,6 +213,7 @@ dependencies {
+     implementation(projects.core.takserver)
+     implementation(projects.feature.intro)
+     implementation(projects.feature.messaging)
++    implementation(projects.feature.meshcore)
+     implementation(projects.feature.connections)
+     implementation(projects.feature.map)
+     implementation(projects.feature.coverage)
+diff --git a/androidApp/src/main/kotlin/org/meshtastic/app/di/AppKoinModule.kt b/androidApp/src/main/kotlin/org/meshtastic/app/di/AppKoinModule.kt
+index 1dca1faa3d0ed595ce630c7cc159c05c4fae200d..e8f730c328220aa9c10ab49eb7f848055c6f7980 100644
+--- a/androidApp/src/main/kotlin/org/meshtastic/app/di/AppKoinModule.kt
++++ b/androidApp/src/main/kotlin/org/meshtastic/app/di/AppKoinModule.kt
+@@ -54,6 +54,7 @@ import org.meshtastic.feature.firmware.di.FeatureFirmwareModule
+ import org.meshtastic.feature.intro.di.FeatureIntroModule
+ import org.meshtastic.feature.map.di.FeatureMapModule
+ import org.meshtastic.feature.messaging.di.FeatureMessagingModule
++import org.meshtastic.feature.meshcore.di.FeatureMeshcoreModule
+ import org.meshtastic.feature.node.di.FeatureNodeModule
+ import org.meshtastic.feature.settings.di.FeatureSettingsModule
+ import org.meshtastic.feature.widget.di.FeatureWidgetModule
+@@ -85,6 +86,7 @@ import org.meshtastic.feature.wifiprovision.di.FeatureWifiProvisionModule
+         CoreUiModule::class,
+         FeatureNodeModule::class,
+         FeatureMessagingModule::class,
++        FeatureMeshcoreModule::class,
+         FeatureConnectionsModule::class,
+         FeatureMapModule::class,
+         FeatureSettingsModule::class,
+diff --git a/feature/meshcore/build.gradle.kts b/feature/meshcore/build.gradle.kts
+new file mode 100644
+index 0000000000000000000000000000000000000000..db974a94979c73a1ecb0bc7284fd0966b86f0584
+--- /dev/null
++++ b/feature/meshcore/build.gradle.kts
+@@ -0,0 +1,40 @@
++/*
++ * Copyright (c) 2026 Meshtastic LLC
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++
++plugins { alias(libs.plugins.meshtastic.kmp.feature) }
++
++kotlin {
++    android { withHostTest { isIncludeAndroidResources = true } }
++
++    sourceSets {
++        commonMain.dependencies {
++            implementation(projects.core.common)
++            implementation(projects.core.di)
++            implementation(projects.core.model)
++            implementation(projects.core.navigation)
++            implementation(projects.core.resources)
++            implementation(projects.core.ui)
++            implementation(libs.kotlinx.coroutines.core)
++            implementation(libs.meshcore)
++        }
++
++        androidMain.dependencies {
++            implementation(projects.core.network)
++            implementation(libs.usb.serial.android)
++        }
++    }
++}
+diff --git a/feature/meshcore/src/androidMain/kotlin/org/meshtastic/feature/meshcore/AndroidMeshCoreAdapters.kt b/feature/meshcore/src/androidMain/kotlin/org/meshtastic/feature/meshcore/AndroidMeshCoreAdapters.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..7494a15cfe5d8b8059cc6c43b506554eaef3a451
+--- /dev/null
++++ b/feature/meshcore/src/androidMain/kotlin/org/meshtastic/feature/meshcore/AndroidMeshCoreAdapters.kt
+@@ -0,0 +1,40 @@
++/*
++ * Copyright (c) 2026 Meshtastic LLC
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++package org.meshtastic.feature.meshcore
++
++import com.darkrockstudios.libs.meshcore.ble.BlueFalconBleAdapter
++import dev.bluefalcon.BlueFalcon
++import org.koin.core.annotation.Single
++import org.meshtastic.core.common.ContextServices
++import org.meshtastic.core.network.repository.UsbRepository
++
++/**
++ * Android transports for MeshCoreKmp.
++ *
++ * BLE goes through MeshCoreKmp's BlueFalcon adapter. USB is exposed through a
++ * [com.darkrockstudios.libs.meshcore.ble.BleAdapter] shim so the same
++ * [com.darkrockstudios.libs.meshcore.DeviceScanner] and [DeviceConnection]
++ * machinery handles both transports.
++ */
++@Single
++class AndroidMeshCoreAdapters(
++    usbRepository: UsbRepository,
++) : MeshCoreAdapters {
++    override val ble = BlueFalconBleAdapter(BlueFalcon(context = ContextServices.app))
++
++    override val usb = UsbMeshCoreAdapter(usbRepository)
++}
+diff --git a/feature/meshcore/src/androidMain/kotlin/org/meshtastic/feature/meshcore/UsbMeshCoreAdapter.kt b/feature/meshcore/src/androidMain/kotlin/org/meshtastic/feature/meshcore/UsbMeshCoreAdapter.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..dcd4133971109123291cd24b6dfc6b2bf558a2d8
+--- /dev/null
++++ b/feature/meshcore/src/androidMain/kotlin/org/meshtastic/feature/meshcore/UsbMeshCoreAdapter.kt
+@@ -0,0 +1,70 @@
++/*
++ * Copyright (c) 2026 Meshtastic LLC
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++package org.meshtastic.feature.meshcore
++
++import com.darkrockstudios.libs.meshcore.ble.BleAdapter
++import com.darkrockstudios.libs.meshcore.ble.BleConnection
++import com.darkrockstudios.libs.meshcore.ble.DiscoveredDevice
++import com.darkrockstudios.libs.meshcore.ble.ScanFilter
++import kotlinx.coroutines.flow.Flow
++import kotlinx.coroutines.flow.firstOrNull
++import kotlinx.coroutines.flow.map
++import kotlinx.coroutines.withTimeoutOrNull
++import org.meshtastic.core.network.repository.UsbRepository
++import kotlin.time.Duration.Companion.seconds
++
++/**
++ * USB CDC transport exposed as a MeshCoreKmp [BleAdapter].
++ *
++ * MeshCore's USB serial interface expects `<` + uint16 length framing, while its
++ * BLE interface passes one command per characteristic write. [UsbMeshCoreConnection]
++ * bridges that difference.
++ */
++class UsbMeshCoreAdapter(
++    private val usbRepository: UsbRepository,
++) : BleAdapter {
++    override val isBluetoothEnabled: Boolean = usbRepository.isSupported
++
++    override fun scan(filter: ScanFilter): Flow<DiscoveredDevice> =
++        usbRepository.serialDevices.map { drivers ->
++            drivers.map { (id, driver) ->
++                DiscoveredDevice(identifier = id, name = driver.device.deviceName, rssi = 0)
++            }
++        }
++
++    override fun stopScan() = Unit
++
++    override suspend fun connect(device: DiscoveredDevice): BleConnection {
++        val driver =
++            usbRepository.serialDevices.value[device.identifier]
++                ?: error("USB device ${device.identifier} is no longer attached")
++
++        val granted =
++            usbRepository.hasPermission(driver.device) ||
++                (withTimeoutOrNull(15.seconds) { usbRepository.requestPermission(driver.device).firstOrNull() } ==
++                    true)
++        if (!granted) error("USB permission denied for ${device.identifier}")
++
++        val connection =
++            UsbMeshCoreConnection(
++                deviceIdentifier = device.identifier,
++                openSerial = { listener -> usbRepository.createSerialConnection(driver, listener) },
++            )
++        connection.connect()
++        return connection
++    }
++}
+diff --git a/feature/meshcore/src/androidMain/kotlin/org/meshtastic/feature/meshcore/UsbMeshCoreConnection.kt b/feature/meshcore/src/androidMain/kotlin/org/meshtastic/feature/meshcore/UsbMeshCoreConnection.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..f382f471e4e742021bc5c5530d341f5e6b6fac00
+--- /dev/null
++++ b/feature/meshcore/src/androidMain/kotlin/org/meshtastic/feature/meshcore/UsbMeshCoreConnection.kt
+@@ -0,0 +1,150 @@
++/*
++ * Copyright (c) 2026 Meshtastic LLC
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++package org.meshtastic.feature.meshcore
++
++import com.darkrockstudios.libs.meshcore.ble.BleConnection
++import com.darkrockstudios.libs.meshcore.ble.ConnectionState
++import kotlinx.coroutines.CompletableDeferred
++import kotlinx.coroutines.channels.Channel
++import kotlinx.coroutines.flow.Flow
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.receiveAsFlow
++import kotlinx.coroutines.withTimeoutOrNull
++import org.meshtastic.core.network.repository.SerialConnection
++import org.meshtastic.core.network.repository.SerialConnectionListener
++import kotlin.time.Duration.Companion.seconds
++
++/**
++ * A [BleConnection] over MeshCore's USB CDC framing.
++ *
++ * MeshCore USB uses `>` + uint16 LE length + payload for frames from the
++ * firmware and `<` + uint16 LE length + payload for frames to the firmware.
++ * MeshCoreKmp's BLE connection deals in complete command payloads, so the
++ * framing is added/stripped here.
++ */
++class UsbMeshCoreConnection(
++    override val deviceIdentifier: String,
++    private val openSerial: (SerialConnectionListener) -> SerialConnection,
++) : BleConnection, SerialConnectionListener {
++    private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
++    override val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
++
++    private val incoming = Channel<ByteArray>(Channel.UNLIMITED)
++    override val incomingData: Flow<ByteArray> = incoming.receiveAsFlow()
++
++    private val connected = CompletableDeferred<Unit>()
++    private var serial: SerialConnection? = null
++
++    private var parserState = 0
++    private var frameLength = 0
++    private var framePosition = 0
++    private val frame = ByteArray(MAX_FRAME_SIZE)
++
++    suspend fun connect() {
++        _connectionState.value = ConnectionState.Connecting
++        val connection = openSerial(this)
++        serial = connection
++        runCatching { connection.connect() }
++            .onFailure {
++                _connectionState.value = ConnectionState.Error(it.message ?: "USB open failed")
++                throw it
++            }
++
++        val ready = withTimeoutOrNull(15.seconds) { connected.await() } != null
++        if (!ready) {
++            _connectionState.value = ConnectionState.Error("Timed out waiting for MeshCore USB device")
++            error("Timed out waiting for MeshCore USB device")
++        }
++    }
++
++    override suspend fun write(data: ByteArray) {
++        val connection = serial ?: error("MeshCore USB connection is not open")
++        val framed = ByteArray(FRAME_HEADER_SIZE + data.size)
++        framed[0] = '<'.code.toByte()
++        framed[1] = (data.size and 0xFF).toByte()
++        framed[2] = ((data.size shr 8) and 0xFF).toByte()
++        data.copyInto(framed, FRAME_HEADER_SIZE)
++        connection.sendBytes(framed)
++    }
++
++    override suspend fun requestMtu(mtu: Int): Int = MAX_FRAME_SIZE
++
++    override suspend fun disconnect() {
++        runCatching { serial?.close(true) }
++        serial = null
++        _connectionState.value = ConnectionState.Disconnected
++    }
++
++    override fun onConnected() {
++        _connectionState.value = ConnectionState.Connected
++        if (!connected.isCompleted) connected.complete(Unit)
++    }
++
++    override fun onMissingPermission() {
++        _connectionState.value = ConnectionState.Error("USB permission denied")
++        if (!connected.isCompleted) {
++            connected.completeExceptionally(IllegalStateException("USB permission denied"))
++        }
++    }
++
++    override fun onDisconnected(thrown: Exception?) {
++        _connectionState.value = ConnectionState.Disconnected
++        if (!connected.isCompleted) {
++            connected.completeExceptionally(thrown ?: IllegalStateException("USB device disconnected"))
++        }
++    }
++
++    override fun onDataReceived(bytes: ByteArray) {
++        for (byte in bytes) {
++            val value = byte.toInt() and 0xFF
++            when (parserState) {
++                STATE_IDLE -> if (value == '>'.code) parserState = STATE_LENGTH_LOW
++                STATE_LENGTH_LOW -> {
++                    frameLength = value
++                    parserState = STATE_LENGTH_HIGH
++                }
++                STATE_LENGTH_HIGH -> {
++                    frameLength = frameLength or (value shl 8)
++                    if (frameLength in 1..frame.size) {
++                        framePosition = 0
++                        parserState = STATE_PAYLOAD
++                    } else {
++                        parserState = STATE_IDLE
++                    }
++                }
++                STATE_PAYLOAD -> {
++                    frame[framePosition++] = byte
++                    if (framePosition >= frameLength) {
++                        incoming.trySend(frame.copyOf(frameLength))
++                        parserState = STATE_IDLE
++                    }
++                }
++            }
++        }
++    }
++
++    private companion object {
++        const val FRAME_HEADER_SIZE = 3
++        const val MAX_FRAME_SIZE = 176
++        const val STATE_IDLE = 0
++        const val STATE_LENGTH_LOW = 1
++        const val STATE_LENGTH_HIGH = 2
++        const val STATE_PAYLOAD = 3
++    }
++}
+diff --git a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreAdapters.kt b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreAdapters.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..efce450f5bb85add1eb1146a1d288c23a9375d0a
+--- /dev/null
++++ b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreAdapters.kt
+@@ -0,0 +1,42 @@
++/*
++ * Copyright (c) 2026 Meshtastic LLC
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++package org.meshtastic.feature.meshcore
++
++import com.darkrockstudios.libs.meshcore.ble.BleAdapter
++import com.darkrockstudios.libs.meshcore.ble.BleConnection
++import com.darkrockstudios.libs.meshcore.ble.DiscoveredDevice
++import com.darkrockstudios.libs.meshcore.ble.ScanFilter
++import kotlinx.coroutines.flow.Flow
++import kotlinx.coroutines.flow.emptyFlow
++
++/** Platform-supplied MeshCore transports. */
++interface MeshCoreAdapters {
++    val ble: BleAdapter
++    val usb: BleAdapter
++}
++
++/** Used on targets without USB/BLE MeshCore support; the UI still compiles. */
++class NopBleAdapter : BleAdapter {
++    override val isBluetoothEnabled: Boolean = false
++
++    override fun scan(filter: ScanFilter): Flow<DiscoveredDevice> = emptyFlow()
++
++    override fun stopScan() = Unit
++
++    override suspend fun connect(device: DiscoveredDevice): BleConnection =
++        error("MeshCore transport is not available on this platform")
++}
+diff --git a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreRepository.kt b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreRepository.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe2dcb34aa2ef9a5e35fafbc6a3ab29bc9683902
+--- /dev/null
++++ b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreRepository.kt
+@@ -0,0 +1,220 @@
++/*
++ * Copyright (c) 2026 Meshtastic LLC
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++package org.meshtastic.feature.meshcore
++
++import com.darkrockstudios.libs.meshcore.ConnectionConfig
++import com.darkrockstudios.libs.meshcore.DeviceConnection
++import com.darkrockstudios.libs.meshcore.DeviceScanner
++import com.darkrockstudios.libs.meshcore.ble.ConnectionState
++import com.darkrockstudios.libs.meshcore.ble.DiscoveredDevice
++import com.darkrockstudios.libs.meshcore.model.Channel
++import com.darkrockstudios.libs.meshcore.model.Contact
++import com.darkrockstudios.libs.meshcore.model.ReceivedMessage
++import com.darkrockstudios.libs.meshcore.model.SelfInfo
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.ExperimentalCoroutinesApi
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.SharingStarted
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.combine
++import kotlinx.coroutines.flow.filterNotNull
++import kotlinx.coroutines.flow.flatMapLatest
++import kotlinx.coroutines.flow.flowOf
++import kotlinx.coroutines.flow.stateIn
++import kotlinx.coroutines.flow.update
++import kotlinx.coroutines.launch
++import org.koin.core.annotation.Single
++import org.meshtastic.core.di.CoroutineDispatchers
++import org.meshtastic.feature.meshcore.model.MeshCoreChatMessage
++import org.meshtastic.feature.meshcore.model.MeshCoreDevice
++import org.meshtastic.feature.meshcore.model.MeshCoreTransport
++
++/**
++ * Owns the MeshCore companion connection independently of the Meshtastic radio.
++ *
++ * MeshCoreKmp supplies the protocol; this repository only adapts discovery,
++ * connection lifetime and the flat chat message history used by the dedicated tab.
++ */
++@OptIn(ExperimentalCoroutinesApi::class)
++@Single
++class MeshCoreRepository(
++    adapters: MeshCoreAdapters,
++    dispatchers: CoroutineDispatchers,
++) {
++    private val scope = CoroutineScope(SupervisorJob() + dispatchers.io)
++    private val bleScanner = DeviceScanner(adapters.ble)
++    private val usbScanner = DeviceScanner(adapters.usb)
++    private val connection = MutableStateFlow<DeviceConnection?>(null)
++
++    val devices: StateFlow<List<MeshCoreDevice>> =
++        combine(bleScanner.discoveredDevices, usbScanner.discoveredDevices) { ble, usb ->
++            ble.map {
++                MeshCoreDevice(
++                    id = it.identifier,
++                    name = it.name ?: it.identifier,
++                    rssi = it.rssi,
++                    transport = MeshCoreTransport.BLE,
++                )
++            } +
++                usb.map {
++                    MeshCoreDevice(
++                        id = it.identifier,
++                        name = it.name ?: it.identifier,
++                        rssi = it.rssi,
++                        transport = MeshCoreTransport.USB,
++                    )
++                }
++        }.stateIn(scope, SharingStarted.WhileSubscribed(5_000), emptyList<MeshCoreDevice>())
++
++    val connectionState: StateFlow<ConnectionState> =
++        connection
++            .flatMapLatest { it?.connectionState ?: flowOf(ConnectionState.Disconnected) }
++            .stateIn(scope, SharingStarted.WhileSubscribed(5_000), ConnectionState.Disconnected)
++
++    val channels: StateFlow<List<Channel>> =
++        connection
++            .flatMapLatest { it?.channels ?: flowOf(emptyList<Channel>()) }
++            .stateIn(scope, SharingStarted.WhileSubscribed(5_000), emptyList())
++
++    val contacts: StateFlow<List<Contact>> =
++        connection
++            .flatMapLatest { it?.contacts ?: flowOf(emptyList<Contact>()) }
++            .stateIn(scope, SharingStarted.WhileSubscribed(5_000), emptyList())
++
++    val selfInfo: StateFlow<SelfInfo?> =
++        connection
++            .flatMapLatest { it?.selfInfo ?: flowOf<SelfInfo?>(null) }
++            .stateIn(scope, SharingStarted.WhileSubscribed(5_000), null)
++
++    private val _messages = MutableStateFlow<List<MeshCoreChatMessage>>(emptyList())
++    val messages: StateFlow<List<MeshCoreChatMessage>> = _messages.asStateFlow()
++
++    private val _error = MutableStateFlow<String?>(null)
++    val error: StateFlow<String?> = _error.asStateFlow()
++
++    init {
++        scope.launch {
++            connection
++                .filterNotNull()
++                .flatMapLatest { it.incomingMessages }
++                .collect { message ->
++                    val chat =
++                        when (message) {
++                            is ReceivedMessage.ChannelMessage ->
++                                MeshCoreChatMessage(
++                                    text = message.text,
++                                    outgoing = false,
++                                    channelIndex = message.channelIndex,
++                                    timestamp = message.timestamp,
++                                )
++
++                            is ReceivedMessage.ContactMessage ->
++                                MeshCoreChatMessage(
++                                    text = message.text,
++                                    outgoing = false,
++                                    contactPrefix = message.publicKeyPrefix,
++                                    timestamp = message.timestamp,
++                                )
++                        }
++                    _messages.update { (it + chat).take(MAX_MESSAGES) }
++                }
++        }
++    }
++
++    fun startScan(transport: MeshCoreTransport?) {
++        if (transport == null || transport == MeshCoreTransport.BLE) {
++            bleScanner.startScan(scope = scope)
++        }
++        if (transport == null || transport == MeshCoreTransport.USB) {
++            usbScanner.startScan(scope = scope)
++        }
++    }
++
++    suspend fun connect(device: MeshCoreDevice) {
++        _error.value = null
++        bleScanner.stopScan()
++        usbScanner.stopScan()
++
++        val scanner = if (device.transport == MeshCoreTransport.BLE) bleScanner else usbScanner
++        val discovered = DiscoveredDevice(identifier = device.id, name = device.name, rssi = device.rssi)
++
++        runCatching {
++                scanner.connect(
++                    device = discovered,
++                    scope = scope,
++                    config =
++                        ConnectionConfig(
++                            appName = "Meshtastic",
++                            autoSyncTime = true,
++                            autoFetchChannels = true,
++                            autoFetchContacts = true,
++                            autoPollMessages = true,
++                        ),
++                )
++            }
++            .onSuccess {
++                connection.value = it
++                _messages.value = emptyList()
++            }
++            .onFailure { _error.value = it.message ?: "Could not connect to MeshCore device" }
++    }
++
++    suspend fun disconnect() {
++        connection.value?.disconnect()
++        connection.value = null
++    }
++
++    suspend fun sendChannelMessage(channelIndex: Int, text: String) {
++        val conn = connection.value ?: return
++        runCatching { conn.sendChannelMessage(channelIndex = channelIndex, text = text) }
++            .onSuccess {
++                _messages.update {
++                    (it +
++                            MeshCoreChatMessage(
++                                text = text,
++                                outgoing = true,
++                                channelIndex = channelIndex,
++                            ))
++                        .take(MAX_MESSAGES)
++                }
++            }
++            .onFailure { _error.value = it.message ?: "Could not send MeshCore message" }
++    }
++
++    suspend fun sendDirectMessage(contact: Contact, text: String) {
++        val conn = connection.value ?: return
++        runCatching { conn.sendDirectMessage(publicKeyPrefix = contact.publicKeyPrefix, text = text) }
++            .onSuccess {
++                _messages.update {
++                    (it +
++                            MeshCoreChatMessage(
++                                text = text,
++                                outgoing = true,
++                                contactPrefix = contact.publicKeyPrefixHex(),
++                            ))
++                        .take(MAX_MESSAGES)
++                }
++            }
++            .onFailure { _error.value = it.message ?: "Could not send MeshCore message" }
++    }
++
++    private companion object {
++        const val MAX_MESSAGES = 200
++    }
++}
+diff --git a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/di/FeatureMeshcoreModule.kt b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/di/FeatureMeshcoreModule.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..510fc4226cfdeb9e9a6180567047a917f15d8403
+--- /dev/null
++++ b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/di/FeatureMeshcoreModule.kt
+@@ -0,0 +1,24 @@
++/*
++ * Copyright (c) 2026 Meshtastic LLC
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++package org.meshtastic.feature.meshcore.di
++
++import org.koin.core.annotation.ComponentScan
++import org.koin.core.annotation.Module
++
++@Module
++@ComponentScan("org.meshtastic.feature.meshcore")
++class FeatureMeshcoreModule
+diff --git a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/model/MeshCoreModels.kt b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/model/MeshCoreModels.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..07332baa2b1bba16b5544dff498378bf015d58bf
+--- /dev/null
++++ b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/model/MeshCoreModels.kt
+@@ -0,0 +1,44 @@
++/*
++ * Copyright (c) 2026 Meshtastic LLC
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++package org.meshtastic.feature.meshcore.model
++
++/** Physical transport used to reach a MeshCore companion. */
++enum class MeshCoreTransport {
++    USB,
++    BLE,
++}
++
++/** A MeshCore companion discovered on a transport. */
++data class MeshCoreDevice(
++    val id: String,
++    val name: String,
++    val rssi: Int,
++    val transport: MeshCoreTransport,
++)
++
++/**
++ * A message shown in the dedicated MeshCore chat surface.
++ *
++ * MeshCore does not echo sent messages, so outgoing messages are recorded locally.
++ */
++data class MeshCoreChatMessage(
++    val text: String,
++    val outgoing: Boolean,
++    val channelIndex: Int? = null,
++    val contactPrefix: String? = null,
++    val timestamp: Long = 0,
++)
+diff --git a/feature/meshcore/src/iosMain/kotlin/org/meshtastic/feature/meshcore/NoopMeshCoreAdapters.kt b/feature/meshcore/src/iosMain/kotlin/org/meshtastic/feature/meshcore/NoopMeshCoreAdapters.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..131f20c2e3e34791082e58e49c088674c890ae0c
+--- /dev/null
++++ b/feature/meshcore/src/iosMain/kotlin/org/meshtastic/feature/meshcore/NoopMeshCoreAdapters.kt
+@@ -0,0 +1,26 @@
++/*
++ * Copyright (c) 2026 Meshtastic LLC
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++package org.meshtastic.feature.meshcore
++
++import org.koin.core.annotation.Single
++
++/** iOS builds compile the feature module but do not expose USB/BLE MeshCore yet. */
++@Single
++class NoopMeshCoreAdapters : MeshCoreAdapters {
++    override val ble = NopBleAdapter()
++    override val usb = NopBleAdapter()
++}
+diff --git a/feature/meshcore/src/jvmMain/kotlin/org/meshtastic/feature/meshcore/NoopMeshCoreAdapters.kt b/feature/meshcore/src/jvmMain/kotlin/org/meshtastic/feature/meshcore/NoopMeshCoreAdapters.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..16cf740f2b9b3a8c6f91f24e8e5d19be24306cab
+--- /dev/null
++++ b/feature/meshcore/src/jvmMain/kotlin/org/meshtastic/feature/meshcore/NoopMeshCoreAdapters.kt
+@@ -0,0 +1,26 @@
++/*
++ * Copyright (c) 2026 Meshtastic LLC
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++package org.meshtastic.feature.meshcore
++
++import org.koin.core.annotation.Single
++
++/** Desktop builds compile the feature module but do not expose USB/BLE MeshCore yet. */
++@Single
++class NoopMeshCoreAdapters : MeshCoreAdapters {
++    override val ble = NopBleAdapter()
++    override val usb = NopBleAdapter()
++}
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index ff8be2a2c247d8984b160ad3785f72f450b8f8d6..b145d178c27557dd9128e31484c6ade7fbb0c58a 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -26,6 +26,7 @@ koin-plugin = "1.2.1"
+ 
+ # Kotlin
+ kotlin = "2.4.20"
++meshcore = "0.12.0"
+ kotlinx-coroutines-android = "1.11.0"
+ kotlinx-datetime = "0.8.0-0.6.x-compat"
+ kotlinx-serialization = "1.11.0"
+@@ -323,6 +324,7 @@ kermit = { module = "co.touchlab:kermit", version = "2.2.0" }
+ leakcanary-android = { module = "com.squareup.leakcanary:leakcanary-android", version = "2.14" }
+ 
+ usb-serial-android = { module = "com.github.mik3y:usb-serial-for-android", version = "3.11.0" }
++meshcore = { module = "com.darkrockstudios:meshcore", version.ref = "meshcore" }
+ vico-compose = { group = "com.patrykandpatrick.vico", name = "compose", version.ref = "vico" }
+ vico-compose-m3 = { group = "com.patrykandpatrick.vico", name = "compose-m3", version.ref = "vico" }
+ 
+diff --git a/settings.gradle.kts b/settings.gradle.kts
+index 5f7a581177ca96d57aac5df1f2eaae032a2adece..430131213adc7b4e4872abcf1a803732d32f2d63 100644
+--- a/settings.gradle.kts
++++ b/settings.gradle.kts
+@@ -109,6 +109,7 @@ include(
+     ":core:ui",
+     ":feature:intro",
+     ":feature:messaging",
++    ":feature:meshcore",
+     ":feature:connections",
+     ":feature:map",
+     ":feature:map-maplibre",

@@ -2,3 +2,4 @@
 # sources (notably MeshCore) intentionally reproduce their original trailing
 # whitespace, so whitespace checks on the generated artifacts would be noise.
 patches/*.patch -whitespace
+patches/**/*.patch -whitespace

@@ -1,10 +1,14 @@
 # Raumata
 
-Raumata is a patch series on top of [Meshtastic firmware](https://github.com/meshtastic/firmware).
+Raumata manages two downstream patch series:
 
-The patches in [`patches/`](./patches) are the real history of this project.
-Commits in this repository are bookkeeping: they may be squashed, reordered or
-rewritten whenever the series is regenerated. The tooling is adapted from
+- [`patches/`](./patches) on top of [Meshtastic firmware](https://github.com/meshtastic/firmware).
+- [`patches/android/`](./patches/android) on top of the
+  [Meshtastic Android client](https://github.com/meshtastic/Meshtastic-Android).
+
+The patches are the real history of each project. Commits in this repository are
+bookkeeping: they may be squashed, reordered or rewritten whenever a series is
+regenerated. The tooling is adapted from
 [cheetah-1.16's patch-series scripts](https://github.com/gommehdnet/cheetah-1.16/tree/master/scripts).
 
 ## Current series: Meshtastic + MeshCore
@@ -36,6 +40,27 @@ pio run -e heltec-v3-dual
 
 `heltec-v3-dual` is the only build target verified by this series.
 
+## Current series: Android MeshCore companion
+
+The Android series adds a dedicated **MeshCore** tab to the Meshtastic Android
+client, built on
+[MeshCoreKmp](https://github.com/Wavesonics/MeshCoreKmp):
+
+- USB and BLE transports. USB uses the app's existing `UsbRepository` and adds
+  MeshCore's `<`/`>` CDC framing; BLE uses MeshCoreKmp's BlueFalcon adapter.
+- A separate MeshCore repository and chat surface, so MeshCore identities,
+  channels and contacts do not pollute the Meshtastic node/message database.
+- Connect, scan, channel/contact lists, and direct/group text.
+
+The Android series is pinned to `v2.8.3`. Patch application is verified; the
+Android build is not run in this workspace.
+
+```sh
+scripts/apply-android.sh
+scripts/rebuild-android-patches.sh
+scripts/verify-android.sh
+```
+
 ## Design notes
 
 - [Dual identity, presence, and simultaneous companion access](./docs/dual-identity-and-companion.md)
@@ -48,12 +73,16 @@ pio run -e heltec-v3-dual
 
 ## Layout
 
-| Path              | Purpose                                                        |
-| ----------------- | -------------------------------------------------------------- |
-| `patches/`        | The patch series, applied in filename order.                   |
-| `upstream.conf`   | Pinned Meshtastic firmware tag and commit.                     |
-| `scripts/`        | Apply, export, verify and rebase the series.                   |
-| `work/firmware/`  | Scratch clone of upstream (ignored by git).                    |
+| Path                  | Purpose                                                        |
+| --------------------- | -------------------------------------------------------------- |
+| `patches/`            | Firmware patch series, applied in filename order.              |
+| `patches/android/`    | Android client patch series.                                   |
+| `upstream.conf`       | Pinned Meshtastic firmware tag and commit.                     |
+| `upstream-android.conf` | Pinned Meshtastic Android tag and commit.                    |
+| `scripts/`            | Firmware apply/export/verify/rebase tooling.                   |
+| `scripts/*-android.sh`| Android apply/export/verify tooling.                           |
+| `work/firmware/`      | Scratch firmware clone (ignored by git).                       |
+| `work/android/`       | Scratch Android clone (ignored by git).                        |
 
 ## Requirements
 
@@ -142,6 +171,10 @@ To update only the base without exporting patches, add `--no-rebuild`.
 | `scripts/rebuildpatches.sh`| Export commits from `work/firmware` to `patches/`.   |
 | `scripts/verify.sh`        | Check the series applies cleanly in a temp worktree. |
 | `scripts/upstream.sh`      | Rebase the series onto a newer upstream release.     |
+| `scripts/init-android.sh`  | Shared Android config and helpers (sourced).         |
+| `scripts/apply-android.sh` | Reset `work/android` to the base and apply patches.  |
+| `scripts/rebuild-android-patches.sh` | Export Android commits to `patches/android/`. |
+| `scripts/verify-android.sh`| Check the Android series applies cleanly.            |
 
 The upstream base is pinned by both tag and commit in `upstream.conf`; changing
 it by hand works too, but `scripts/upstream.sh` also rebases the series.

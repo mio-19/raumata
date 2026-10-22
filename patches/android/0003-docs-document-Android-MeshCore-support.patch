@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mio <mio@mio19.uk>
+Date: Thu, 22 Oct 2026 23:17:36 +1100
+Subject: [PATCH] docs: document Android MeshCore support
+
+
+diff --git a/feature/meshcore/README.md b/feature/meshcore/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..9b04eaed7f510faffac6209bd29a09afa57e2966
+--- /dev/null
++++ b/feature/meshcore/README.md
+@@ -0,0 +1,56 @@
++# feature:meshcore
++
++Dedicated MeshCore companion surface for the Raumata dual-protocol firmware.
++
++This module is intentionally separate from the Meshtastic node/message data
++model. MeshCore has its own ed25519 identities, channels and contacts, so mixing
++its records into the Meshtastic node database would create ambiguous identities
++and break assumptions in the existing repositories.
++
++## Transports
++
++MeshCoreKmp (`com.darkrockstudios:meshcore`) supplies the companion protocol,
++command queue, response parsing and high-level contacts/channels/messages API.
++Both transports are exposed to it as a `BleAdapter`:
++
++- **BLE** — `BlueFalconBleAdapter(BlueFalcon(context))`. MeshCore's BLE
++  interface sends one command per Nordic UART characteristic write.
++- **USB** — `UsbMeshCoreAdapter`, backed by the app's existing
++  `UsbRepository`/`SerialConnection`. MeshCore's USB CDC interface uses
++  `<` + uint16 LE length + payload for commands and `>` + uint16 LE length +
++  payload for responses, so `UsbMeshCoreConnection` adds/strips that framing
++  while presenting complete command payloads to MeshCoreKmp.
++
++USB permission is requested through the app's existing `UsbRepository`; BLE
++uses the app's existing Bluetooth permissions.
++
++## Structure
++
++| Path | Purpose |
++| --- | --- |
++| `MeshCoreAdapters.kt` | Platform transport interface + no-op adapter |
++| `MeshCoreRepository.kt` | Discovery, connection lifetime, channels/contacts, chat history |
++| `MeshCoreViewModel.kt` | UI state and actions |
++| `ui/MeshCoreScreen.kt` | Dedicated MeshCore tab |
++| `navigation/MeshCoreNavigation.kt` | Navigation 3 entry |
++| `androidMain/AndroidMeshCoreAdapters.kt` | Android BLE + USB adapters |
++| `androidMain/UsbMeshCoreConnection.kt` | MeshCore USB CDC framing |
++| `jvmMain`/`iosMain` | No-op adapters so the KMP module still compiles |
++
++## Usage
++
++Select the **MeshCore** destination in the app shell, choose USB or Bluetooth,
++scan, and connect. The screen shows channels and contacts; tapping one opens a
++chat pane with a message composer.
++
++## Limitations
++
++- MeshCore's BLE companion service must be enabled in the firmware. The current
++  firmware exposes MeshCore over USB; BLE MeshCore support is a separate
++  firmware series.
++- The app does not bridge MeshCore messages into the Meshtastic conversations
++  list. That requires the optional bridge described in the raumata design docs.
++- Only the companion subset implemented by the firmware is available: app
++  start, device query, contacts, channels, text, adverts and battery/storage.
++- The USB transport is Android-only; desktop uses the no-op adapter until a
++  desktop transport is added.

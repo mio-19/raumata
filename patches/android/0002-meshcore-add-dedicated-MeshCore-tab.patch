@@ -1,0 +1,542 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mio <mio@mio19.uk>
+Date: Thu, 22 Oct 2026 23:17:36 +1100
+Subject: [PATCH] meshcore: add dedicated MeshCore tab
+
+Add a MeshCore top-level destination, navigation graph, view model and Compose screen. The screen connects over USB or BLE, lists channels and contacts, and provides direct/group chat without merging MeshCore records into the Meshtastic UI.
+
+diff --git a/androidApp/src/main/kotlin/org/meshtastic/app/ui/Main.kt b/androidApp/src/main/kotlin/org/meshtastic/app/ui/Main.kt
+index 43767ebcc7a4f1b26eec7ce849b476022129757f..9473cbce5da38c8b40e0bf5b1ac49395b3bfc2f2 100644
+--- a/androidApp/src/main/kotlin/org/meshtastic/app/ui/Main.kt
++++ b/androidApp/src/main/kotlin/org/meshtastic/app/ui/Main.kt
+@@ -54,6 +54,7 @@ import org.meshtastic.feature.docs.navigation.docsEntries
+ import org.meshtastic.feature.firmware.navigation.firmwareGraph
+ import org.meshtastic.feature.map.navigation.mapGraph
+ import org.meshtastic.feature.messaging.navigation.contactsGraph
++import org.meshtastic.feature.meshcore.navigation.meshCoreGraph
+ import org.meshtastic.feature.node.navigation.nodesGraph
+ import org.meshtastic.feature.settings.lockdown.LockdownDialog
+ import org.meshtastic.feature.settings.navigation.rememberSettingsRadioConfigViewModelProvider
+@@ -99,6 +100,7 @@ fun MainScreen() {
+                 entryProvider =
+                 entryProvider<NavKey> {
+                     contactsGraph(backStack, scrollToTopEvents, onHandleDeepLink = viewModel::handleDeepLink)
++                    meshCoreGraph(backStack)
+                     nodesGraph(
+                         backStack = backStack,
+                         scrollToTopEvents = scrollToTopEvents,
+diff --git a/core/navigation/src/commonMain/kotlin/org/meshtastic/core/navigation/NavigationConfig.kt b/core/navigation/src/commonMain/kotlin/org/meshtastic/core/navigation/NavigationConfig.kt
+index dc8f5ce678b16685e3362ca63d3a49b7c0672670..ed10319434af584c52f0baa7f90134c7b78b7a27 100644
+--- a/core/navigation/src/commonMain/kotlin/org/meshtastic/core/navigation/NavigationConfig.kt
++++ b/core/navigation/src/commonMain/kotlin/org/meshtastic/core/navigation/NavigationConfig.kt
+@@ -33,6 +33,7 @@ val MeshtasticNavSavedStateConfig = SavedStateConfiguration {
+             subclassesOfSealed<ChannelsRoute>()
+             subclassesOfSealed<ConnectionsRoute>()
+             subclassesOfSealed<ContactsRoute>()
++            subclassesOfSealed<MeshCoreRoute>()
+             subclassesOfSealed<MapRoute>()
+             subclassesOfSealed<NodesRoute>()
+             subclassesOfSealed<NodeDetailRoute>()
+diff --git a/core/navigation/src/commonMain/kotlin/org/meshtastic/core/navigation/Routes.kt b/core/navigation/src/commonMain/kotlin/org/meshtastic/core/navigation/Routes.kt
+index 0af0502add265b86b70816e2e7510d780aa555db..1cb198088b426c1f948a8fccd71c786c70c45e1d 100644
+--- a/core/navigation/src/commonMain/kotlin/org/meshtastic/core/navigation/Routes.kt
++++ b/core/navigation/src/commonMain/kotlin/org/meshtastic/core/navigation/Routes.kt
+@@ -52,6 +52,12 @@ sealed interface ContactsRoute : Route {
+     @Serializable data object QuickChat : ContactsRoute
+ }
+ 
++/** Dedicated MeshCore companion surface, independent of the Meshtastic node/message data. */
++@Serializable
++sealed interface MeshCoreRoute : Route {
++    @Serializable data object MeshCore : MeshCoreRoute, Graph
++}
++
+ @Serializable
+ sealed interface MapRoute : Route {
+     @Serializable data class Map(val waypointId: Int? = null, val sitePlannerNodeNum: Int? = null) : MapRoute
+diff --git a/core/navigation/src/commonMain/kotlin/org/meshtastic/core/navigation/TopLevelDestination.kt b/core/navigation/src/commonMain/kotlin/org/meshtastic/core/navigation/TopLevelDestination.kt
+index 726ef30fdbe250616871748ec440eefa0a0caaa3..ee6a6d5b12e055cc68761620098f15d27e660fc2 100644
+--- a/core/navigation/src/commonMain/kotlin/org/meshtastic/core/navigation/TopLevelDestination.kt
++++ b/core/navigation/src/commonMain/kotlin/org/meshtastic/core/navigation/TopLevelDestination.kt
+@@ -33,6 +33,7 @@ import org.meshtastic.core.resources.nodes
+  */
+ enum class TopLevelDestination(val label: StringResource, val route: Route) {
+     Messages(Res.string.messages, ContactsRoute.Contacts),
++    MeshCore(Res.string.meshcore, MeshCoreRoute.MeshCore),
+     Nodes(Res.string.nodes, NodesRoute.Nodes),
+     Map(Res.string.map, MapRoute.Map()),
+     Settings(Res.string.bottom_nav_settings, SettingsRoute.Settings()),
+diff --git a/core/resources/src/commonMain/composeResources/values/strings.xml b/core/resources/src/commonMain/composeResources/values/strings.xml
+index f13aa2138291b464a8b144cbf5a9e3c3699b7b4c..6f18c7f643f05f7eb711b595b9d30bf6f4418df7 100644
+--- a/core/resources/src/commonMain/composeResources/values/strings.xml
++++ b/core/resources/src/commonMain/composeResources/values/strings.xml
+@@ -1215,6 +1215,7 @@
+     <string name="message_status_unknown">Unknown</string>
+     <string name="message_translated_label">Translated</string>
+     <string name="messages">Messages</string>
++    <string name="meshcore">MeshCore</string>
+     <string name="metric_channel_label">%1$s %2$d</string>
+     <string name="micrograms_per_cubic_meter">µg/m³</string>
+     <string name="min">Min</string>
+diff --git a/core/ui/src/commonMain/kotlin/org/meshtastic/core/ui/navigation/TopLevelDestinationExt.kt b/core/ui/src/commonMain/kotlin/org/meshtastic/core/ui/navigation/TopLevelDestinationExt.kt
+index 640b4ba87142f7761b4ec90cebdb34f34afcbd22..209f041797539094f9817e0b8619f07dbe59eaff 100644
+--- a/core/ui/src/commonMain/kotlin/org/meshtastic/core/ui/navigation/TopLevelDestinationExt.kt
++++ b/core/ui/src/commonMain/kotlin/org/meshtastic/core/ui/navigation/TopLevelDestinationExt.kt
+@@ -30,6 +30,7 @@ val TopLevelDestination.icon: DrawableResource
+     get() =
+         when (this) {
+             TopLevelDestination.Messages -> Res.drawable.ic_forum
++            TopLevelDestination.MeshCore -> Res.drawable.ic_nodes
+             TopLevelDestination.Nodes -> Res.drawable.ic_nodes
+             TopLevelDestination.Map -> Res.drawable.ic_map
+             TopLevelDestination.Settings -> Res.drawable.ic_settings
+diff --git a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreViewModel.kt b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreViewModel.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..bf114df965f26703a287e24dcf081577533024af
+--- /dev/null
++++ b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreViewModel.kt
+@@ -0,0 +1,91 @@
++/*
++ * Copyright (c) 2026 Meshtastic LLC
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++package org.meshtastic.feature.meshcore
++
++import androidx.lifecycle.ViewModel
++import androidx.lifecycle.viewModelScope
++import com.darkrockstudios.libs.meshcore.model.Contact
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.launch
++import org.koin.core.annotation.KoinViewModel
++import org.meshtastic.feature.meshcore.model.MeshCoreDevice
++import org.meshtastic.feature.meshcore.model.MeshCoreTransport
++
++@KoinViewModel
++class MeshCoreViewModel(private val repository: MeshCoreRepository) : ViewModel() {
++    val devices = repository.devices
++    val connectionState = repository.connectionState
++    val channels = repository.channels
++    val contacts = repository.contacts
++    val selfInfo = repository.selfInfo
++    val messages = repository.messages
++    val error = repository.error
++
++    private val _transport = MutableStateFlow(MeshCoreTransport.USB)
++    val transport: StateFlow<MeshCoreTransport> = _transport.asStateFlow()
++
++    private val _selectedChannel = MutableStateFlow<Int?>(null)
++    val selectedChannel: StateFlow<Int?> = _selectedChannel.asStateFlow()
++
++    private val _selectedContact = MutableStateFlow<Contact?>(null)
++    val selectedContact: StateFlow<Contact?> = _selectedContact.asStateFlow()
++
++    fun setTransport(transport: MeshCoreTransport) {
++        _transport.value = transport
++    }
++
++    fun scan() = repository.startScan(_transport.value)
++
++    fun scanAll() = repository.startScan(null)
++
++    fun connect(device: MeshCoreDevice) {
++        viewModelScope.launch { repository.connect(device) }
++    }
++
++    fun disconnect() {
++        viewModelScope.launch { repository.disconnect() }
++    }
++
++    fun selectChannel(index: Int) {
++        _selectedChannel.value = index
++        _selectedContact.value = null
++    }
++
++    fun selectContact(contact: Contact) {
++        _selectedContact.value = contact
++        _selectedChannel.value = null
++    }
++
++    fun clearSelection() {
++        _selectedChannel.value = null
++        _selectedContact.value = null
++    }
++
++    fun send(text: String) {
++        if (text.isBlank()) return
++        viewModelScope.launch {
++            val channel = _selectedChannel.value
++            val contact = _selectedContact.value
++            when {
++                channel != null -> repository.sendChannelMessage(channel, text)
++                contact != null -> repository.sendDirectMessage(contact, text)
++            }
++        }
++    }
++}
+diff --git a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/navigation/MeshCoreNavigation.kt b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/navigation/MeshCoreNavigation.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..68d09c1974ff61ae5390db2a1d558d6eb367b2e1
+--- /dev/null
++++ b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/navigation/MeshCoreNavigation.kt
+@@ -0,0 +1,32 @@
++/*
++ * Copyright (c) 2026 Meshtastic LLC
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++package org.meshtastic.feature.meshcore.navigation
++
++import androidx.navigation3.runtime.EntryProviderScope
++import androidx.navigation3.runtime.NavBackStack
++import androidx.navigation3.runtime.NavKey
++import org.koin.compose.viewmodel.koinViewModel
++import org.meshtastic.core.navigation.MeshCoreRoute
++import org.meshtastic.feature.meshcore.MeshCoreViewModel
++import org.meshtastic.feature.meshcore.ui.MeshCoreScreen
++
++/** Navigation entry for the dedicated MeshCore companion tab. */
++fun EntryProviderScope<NavKey>.meshCoreGraph(backStack: NavBackStack<NavKey>) {
++    entry<MeshCoreRoute.MeshCore> {
++        MeshCoreScreen(viewModel = koinViewModel<MeshCoreViewModel>())
++    }
++}
+diff --git a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/ui/MeshCoreScreen.kt b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/ui/MeshCoreScreen.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..b17765bc3167de4034b745461bae42a7bf74ba35
+--- /dev/null
++++ b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/ui/MeshCoreScreen.kt
+@@ -0,0 +1,309 @@
++/*
++ * Copyright (c) 2026 Meshtastic LLC
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++package org.meshtastic.feature.meshcore.ui
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.PaddingValues
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.items
++import androidx.compose.material3.Button
++import androidx.compose.material3.Card
++import androidx.compose.material3.ExperimentalMaterial3Api
++import androidx.compose.material3.FilterChip
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Scaffold
++import androidx.compose.material3.Tab
++import androidx.compose.material3.TabRow
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.material3.TopAppBar
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.unit.dp
++import com.darkrockstudios.libs.meshcore.ble.ConnectionState
++import com.darkrockstudios.libs.meshcore.model.Channel
++import com.darkrockstudios.libs.meshcore.model.Contact
++import org.koin.compose.viewmodel.koinViewModel
++import org.meshtastic.feature.meshcore.MeshCoreViewModel
++import org.meshtastic.feature.meshcore.model.MeshCoreChatMessage
++import org.meshtastic.feature.meshcore.model.MeshCoreDevice
++import org.meshtastic.feature.meshcore.model.MeshCoreTransport
++
++/**
++ * Dedicated MeshCore companion surface. It deliberately does not reuse the
++ * Meshtastic node/message data model: the two meshes have different identities,
++ * channels and contact databases.
++ */
++@OptIn(ExperimentalMaterial3Api::class)
++@Composable
++fun MeshCoreScreen(viewModel: MeshCoreViewModel = koinViewModel()) {
++    val connectionState by viewModel.connectionState.collectAsState()
++    val devices by viewModel.devices.collectAsState()
++    val channels by viewModel.channels.collectAsState()
++    val contacts by viewModel.contacts.collectAsState()
++    val messages by viewModel.messages.collectAsState()
++    val transport by viewModel.transport.collectAsState()
++    val selectedChannel by viewModel.selectedChannel.collectAsState()
++    val selectedContact by viewModel.selectedContact.collectAsState()
++    val error by viewModel.error.collectAsState()
++
++    val connected = connectionState is ConnectionState.Connected
++
++    Scaffold(
++        topBar = {
++            TopAppBar(
++                title = { Text("MeshCore") },
++                actions = {
++                    if (connected) {
++                        TextButton(onClick = viewModel::disconnect) { Text("Disconnect") }
++                    }
++                },
++            )
++        },
++    ) { padding ->
++        Column(modifier = Modifier.padding(padding).fillMaxSize()) {
++            ConnectionBanner(connectionState)
++            error?.let {
++                Text(
++                    text = it,
++                    color = MaterialTheme.colorScheme.error,
++                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
++                )
++            }
++
++            if (!connected) {
++                DevicePicker(
++                    transport = transport,
++                    devices = devices,
++                    onTransport = viewModel::setTransport,
++                    onScan = viewModel::scan,
++                    onConnect = viewModel::connect,
++                )
++            } else {
++                val channel = selectedChannel
++                val contact = selectedContact
++                if (channel == null && contact == null) {
++                    ConnectedBrowser(
++                        channels = channels,
++                        contacts = contacts,
++                        onChannel = viewModel::selectChannel,
++                        onContact = viewModel::selectContact,
++                    )
++                } else {
++                    val title =
++                        if (channel != null) {
++                            channels.firstOrNull { it.index == channel }?.name ?: "Channel $channel"
++                        } else {
++                            contact?.name ?: "Contact"
++                        }
++                    ChatPane(
++                        title = title,
++                        messages =
++                            messages.filter { message ->
++                                if (channel != null) {
++                                    message.channelIndex == channel && message.contactPrefix == null
++                                } else {
++                                    message.contactPrefix == contact?.publicKeyPrefixHex()
++                                }
++                            },
++                        onBack = viewModel::clearSelection,
++                        onSend = viewModel::send,
++                    )
++                }
++            }
++        }
++    }
++}
++
++@Composable
++private fun ConnectionBanner(state: ConnectionState) {
++    val text =
++        when (state) {
++            ConnectionState.Disconnected -> "Not connected"
++            ConnectionState.Connecting -> "Connecting…"
++            ConnectionState.Connected -> "Connected"
++            is ConnectionState.Error -> state.message
++        }
++    Text(
++        text = text,
++        style = MaterialTheme.typography.bodyMedium,
++        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
++    )
++}
++
++@OptIn(ExperimentalMaterial3Api::class)
++@Composable
++private fun DevicePicker(
++    transport: MeshCoreTransport,
++    devices: List<MeshCoreDevice>,
++    onTransport: (MeshCoreTransport) -> Unit,
++    onScan: () -> Unit,
++    onConnect: (MeshCoreDevice) -> Unit,
++) {
++    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
++        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++            FilterChip(
++                selected = transport == MeshCoreTransport.USB,
++                onClick = { onTransport(MeshCoreTransport.USB) },
++                label = { Text("USB") },
++            )
++            FilterChip(
++                selected = transport == MeshCoreTransport.BLE,
++                onClick = { onTransport(MeshCoreTransport.BLE) },
++                label = { Text("Bluetooth") },
++            )
++            Spacer(Modifier.weight(1f))
++            Button(onClick = onScan) { Text("Scan") }
++        }
++
++        Spacer(Modifier.height(12.dp))
++
++        if (devices.isEmpty()) {
++            Text("No MeshCore devices found. Tap Scan.")
++        } else {
++            LazyColumn(
++                modifier = Modifier.fillMaxSize(),
++                contentPadding = PaddingValues(vertical = 8.dp),
++                verticalArrangement = Arrangement.spacedBy(8.dp),
++            ) {
++                items(items = devices, key = { it.id + ":" + it.transport.name }) { device ->
++                    Card(
++                        modifier = Modifier.fillMaxWidth(),
++                        onClick = { onConnect(device) },
++                    ) {
++                        Column(modifier = Modifier.padding(16.dp)) {
++                            Text(device.name, style = MaterialTheme.typography.titleMedium)
++                            Text("${device.transport.name} · ${device.rssi} dBm")
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
++
++@OptIn(ExperimentalMaterial3Api::class)
++@Composable
++private fun ConnectedBrowser(
++    channels: List<Channel>,
++    contacts: List<Contact>,
++    onChannel: (Int) -> Unit,
++    onContact: (Contact) -> Unit,
++) {
++    var tab by remember { mutableIntStateOf(0) }
++
++    Column(modifier = Modifier.fillMaxSize()) {
++        TabRow(selectedTabIndex = tab) {
++            Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Channels") })
++            Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Contacts") })
++        }
++
++        LazyColumn(
++            modifier = Modifier.fillMaxSize(),
++            contentPadding = PaddingValues(16.dp),
++            verticalArrangement = Arrangement.spacedBy(8.dp),
++        ) {
++            if (tab == 0) {
++                items(items = channels, key = { it.index }) { channel ->
++                    Card(modifier = Modifier.fillMaxWidth(), onClick = { onChannel(channel.index) }) {
++                        Column(modifier = Modifier.padding(16.dp)) {
++                            Text(channel.name, style = MaterialTheme.typography.titleMedium)
++                            Text("Channel ${channel.index}")
++                        }
++                    }
++                }
++            } else {
++                items(items = contacts, key = { it.publicKeyPrefixHex() }) { contact ->
++                    Card(modifier = Modifier.fillMaxWidth(), onClick = { onContact(contact) }) {
++                        Column(modifier = Modifier.padding(16.dp)) {
++                            Text(contact.name, style = MaterialTheme.typography.titleMedium)
++                            Text(contact.publicKeyPrefixHex())
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
++
++@Composable
++private fun ChatPane(
++    title: String,
++    messages: List<MeshCoreChatMessage>,
++    onBack: () -> Unit,
++    onSend: (String) -> Unit,
++) {
++    var draft by remember { mutableStateOf("") }
++
++    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
++        Row(verticalAlignment = Alignment.CenterVertically) {
++            TextButton(onClick = onBack) { Text("Back") }
++            Text(title, style = MaterialTheme.typography.titleMedium)
++        }
++
++        LazyColumn(
++            modifier = Modifier.weight(1f).fillMaxWidth(),
++            contentPadding = PaddingValues(vertical = 8.dp),
++            verticalArrangement = Arrangement.spacedBy(8.dp),
++        ) {
++            items(items = messages) { message ->
++                Row(
++                    modifier = Modifier.fillMaxWidth(),
++                    horizontalArrangement = if (message.outgoing) Arrangement.End else Arrangement.Start,
++                ) {
++                    Card {
++                        Text(message.text, modifier = Modifier.padding(10.dp))
++                    }
++                }
++            }
++        }
++
++        Row(verticalAlignment = Alignment.CenterVertically) {
++            OutlinedTextField(
++                value = draft,
++                onValueChange = { draft = it },
++                modifier = Modifier.weight(1f),
++                placeholder = { Text("Message") },
++                maxLines = 3,
++            )
++            Button(
++                onClick = {
++                    onSend(draft)
++                    draft = ""
++                },
++                modifier = Modifier.padding(start = 8.dp),
++            ) {
++                Text("Send")
++            }
++        }
++    }
++}
