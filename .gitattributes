@@ -1,0 +1,4 @@
+# patches/ contains generated `git format-patch` output.  Vendored upstream
+# sources (notably MeshCore) intentionally reproduce their original trailing
+# whitespace, so whitespace checks on the generated artifacts would be noise.
+patches/*.patch -whitespace
