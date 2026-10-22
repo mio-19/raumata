@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mio <mio@mio19.uk>
+Date: Thu, 22 Oct 2026 23:18:45 +1100
+Subject: [PATCH] meshcore: surface transport and scan errors
+
+Report scan, connect and asynchronous transport failures through the MeshCore tab instead of letting them escape the repository scope.
+
+diff --git a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreRepository.kt b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreRepository.kt
+index fe2dcb34aa2ef9a5e35fafbc6a3ab29bc9683902..2f1a9706c93167036627468fc033748da9a36409 100644
+--- a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreRepository.kt
++++ b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreRepository.kt
+@@ -26,6 +26,7 @@ import com.darkrockstudios.libs.meshcore.model.Contact
+ import com.darkrockstudios.libs.meshcore.model.ReceivedMessage
+ import com.darkrockstudios.libs.meshcore.model.SelfInfo
+ import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.CoroutineExceptionHandler
+ import kotlinx.coroutines.ExperimentalCoroutinesApi
+ import kotlinx.coroutines.SupervisorJob
+ import kotlinx.coroutines.flow.MutableStateFlow
+@@ -57,7 +58,13 @@ class MeshCoreRepository(
+     adapters: MeshCoreAdapters,
+     dispatchers: CoroutineDispatchers,
+ ) {
+-    private val scope = CoroutineScope(SupervisorJob() + dispatchers.io)
++    private val _error = MutableStateFlow<String?>(null)
++    val error: StateFlow<String?> = _error.asStateFlow()
++
++    private val errorHandler = CoroutineExceptionHandler { _, throwable ->
++        _error.value = throwable.message ?: "MeshCore transport error"
++    }
++    private val scope = CoroutineScope(SupervisorJob() + dispatchers.io + errorHandler)
+     private val bleScanner = DeviceScanner(adapters.ble)
+     private val usbScanner = DeviceScanner(adapters.usb)
+     private val connection = MutableStateFlow<DeviceConnection?>(null)
+@@ -105,9 +112,6 @@ class MeshCoreRepository(
+     private val _messages = MutableStateFlow<List<MeshCoreChatMessage>>(emptyList())
+     val messages: StateFlow<List<MeshCoreChatMessage>> = _messages.asStateFlow()
+ 
+-    private val _error = MutableStateFlow<String?>(null)
+-    val error: StateFlow<String?> = _error.asStateFlow()
+-
+     init {
+         scope.launch {
+             connection
+@@ -139,10 +143,12 @@ class MeshCoreRepository(
+ 
+     fun startScan(transport: MeshCoreTransport?) {
+         if (transport == null || transport == MeshCoreTransport.BLE) {
+-            bleScanner.startScan(scope = scope)
++            runCatching { bleScanner.startScan(scope = scope) }
++                .onFailure { _error.value = it.message ?: "Bluetooth scan failed" }
+         }
+         if (transport == null || transport == MeshCoreTransport.USB) {
+-            usbScanner.startScan(scope = scope)
++            runCatching { usbScanner.startScan(scope = scope) }
++                .onFailure { _error.value = it.message ?: "USB scan failed" }
+         }
+     }
+ 
