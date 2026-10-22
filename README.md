@@ -42,6 +42,9 @@ pio run -e heltec-v3-dual
   covers linking the Meshtastic and MeshCore identities, advertising the node
   in both meshes, and running a Meshtastic app and a MeshCore app at the same
   time.
+- [Shared PHY profiles and preset selection](./docs/shared-phy-profiles.md)
+  covers keeping the radio in one selectable physical configuration that can
+  be a Meshtastic preset, a MeshCore preset, a dual preset, or custom values.
 
 ## Layout
 

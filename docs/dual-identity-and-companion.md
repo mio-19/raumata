@@ -9,6 +9,13 @@ framing on USB serial. It does **not** yet link the two identities explicitly,
 schedule their presence, or support two companion apps at the same time. This
 document specifies how to add those pieces.
 
+> The PHY is a first-class, selectable profile rather than “MeshCore mirrors
+> Meshtastic.” See
+> [shared-phy-profiles.md](./shared-phy-profiles.md). The current series still
+> mirrors Meshtastic's PHY; the next PHY series replaces that with a profile
+> that can be a Meshtastic preset, a MeshCore preset, a dual preset, or custom
+> values.
+
 ## 1. Goals
 
 - One physical node appears as a normal Meshtastic node **and** a normal
@@ -216,6 +223,9 @@ Add a shared airtime budget:
 - Region-aware: EU 868 has a 1% duty-cycle limit; AU 915–928 MHz does not
   have the same limit but still needs fair airtime. The budget must use the
   same region configuration Meshtastic uses.
+- Profile-aware: the selected PHY profile determines time-on-air. Recompute
+  the budget when the profile changes, and re-advertise both stacks after the
+  change.
 
 ### 5.4 What “appear in both” means
 
