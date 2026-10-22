@@ -36,6 +36,13 @@ pio run -e heltec-v3-dual
 
 `heltec-v3-dual` is the only build target verified by this series.
 
+## Design notes
+
+- [Dual identity, presence, and simultaneous companion access](./docs/dual-identity-and-companion.md)
+  covers linking the Meshtastic and MeshCore identities, advertising the node
+  in both meshes, and running a Meshtastic app and a MeshCore app at the same
+  time.
+
 ## Layout
 
 | Path              | Purpose                                                        |
