@@ -1,0 +1,1160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mio <mio@mio19.uk>
+Date: Thu, 22 Oct 2026 23:00:40 +1100
+Subject: [PATCH] raumata: add MeshCore node and shared-PHY radio bridge
+
+Implement a mesh::Radio bridge that reuses Meshtastic's SX1262 through the raw-frame API, tags MeshCore frames with RAUM, and queues received frames for the MeshCore dispatcher. Add a BaseChatMesh node with NVS identity, persisted channels, adverts, direct/group text, and a companion-protocol command subset.
+
+diff --git a/src/raumata/CompanionProtocol.h b/src/raumata/CompanionProtocol.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..a54e756c1183a1c04a3209e184f9eb14ff7964df
+--- /dev/null
++++ b/src/raumata/CompanionProtocol.h
+@@ -0,0 +1,63 @@
++#pragma once
++
++#include <stdint.h>
++
++// Subset of the MeshCore companion protocol used by the Raumata bridge.
++namespace raumata::protocol {
++
++// App -> firmware
++constexpr uint8_t CMD_APP_START = 1;
++constexpr uint8_t CMD_SEND_TXT_MSG = 2;
++constexpr uint8_t CMD_SEND_CHANNEL_TXT_MSG = 3;
++constexpr uint8_t CMD_GET_CONTACTS = 4;
++constexpr uint8_t CMD_GET_DEVICE_TIME = 5;
++constexpr uint8_t CMD_SET_DEVICE_TIME = 6;
++constexpr uint8_t CMD_SEND_SELF_ADVERT = 7;
++constexpr uint8_t CMD_SET_ADVERT_NAME = 8;
++constexpr uint8_t CMD_SYNC_NEXT_MESSAGE = 10;
++constexpr uint8_t CMD_REBOOT = 19;
++constexpr uint8_t CMD_GET_BATT_AND_STORAGE = 20;
++constexpr uint8_t CMD_DEVICE_QUERY = 22;
++constexpr uint8_t CMD_GET_CONTACT_BY_KEY = 30;
++constexpr uint8_t CMD_GET_CHANNEL = 31;
++constexpr uint8_t CMD_SET_CHANNEL = 32;
++constexpr uint8_t CMD_SET_RADIO_PARAMS = 11;
++constexpr uint8_t CMD_SET_RADIO_TX_POWER = 12;
++constexpr uint8_t CMD_GET_STATS = 56;
++
++// Firmware -> app
++constexpr uint8_t RESP_CODE_OK = 0;
++constexpr uint8_t RESP_CODE_ERR = 1;
++constexpr uint8_t RESP_CODE_CONTACTS_START = 2;
++constexpr uint8_t RESP_CODE_CONTACT = 3;
++constexpr uint8_t RESP_CODE_END_OF_CONTACTS = 4;
++constexpr uint8_t RESP_CODE_SELF_INFO = 5;
++constexpr uint8_t RESP_CODE_SENT = 6;
++constexpr uint8_t RESP_CODE_CONTACT_MSG_RECV = 7;
++constexpr uint8_t RESP_CODE_CHANNEL_MSG_RECV = 8;
++constexpr uint8_t RESP_CODE_CURR_TIME = 9;
++constexpr uint8_t RESP_CODE_NO_MORE_MESSAGES = 10;
++constexpr uint8_t RESP_CODE_BATT_AND_STORAGE = 12;
++constexpr uint8_t RESP_CODE_DEVICE_INFO = 13;
++constexpr uint8_t RESP_CODE_CONTACT_MSG_RECV_V3 = 16;
++constexpr uint8_t RESP_CODE_CHANNEL_MSG_RECV_V3 = 17;
++constexpr uint8_t RESP_CODE_CHANNEL_INFO = 18;
++constexpr uint8_t PUSH_CODE_MSG_WAITING = 0x83;
++
++constexpr uint8_t ERR_CODE_UNSUPPORTED_CMD = 1;
++constexpr uint8_t ERR_CODE_NOT_FOUND = 2;
++constexpr uint8_t ERR_CODE_TABLE_FULL = 3;
++constexpr uint8_t ERR_CODE_BAD_STATE = 4;
++constexpr uint8_t ERR_CODE_ILLEGAL_ARG = 6;
++
++constexpr uint8_t RAUMATA_ADV_TYPE_CHAT = 1;
++constexpr uint8_t RAUMATA_TXT_TYPE_PLAIN = 0;
++
++constexpr uint8_t FIRMWARE_VER_CODE = 14;
++constexpr const char *FIRMWARE_VERSION = "raumata-0.1";
++constexpr const char *FIRMWARE_BUILD_DATE = "22 Oct 2026";
++constexpr const char *MANUFACTURER_NAME = "Raumata";
++
++#define RAUMATA_PUBLIC_GROUP_PSK "izOH6cXN6mrJ5e26oRXNcg=="
++
++} // namespace raumata::protocol
+diff --git a/src/raumata/MeshCoreNode.cpp b/src/raumata/MeshCoreNode.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..7dd3d4c975df364ea955add2f76814b23a6fe02b
+--- /dev/null
++++ b/src/raumata/MeshCoreNode.cpp
+@@ -0,0 +1,732 @@
++#ifdef RAUMATA_DUAL_PROTOCOL
++#include "MeshCoreNode.h"
++
++#include <cstring>
++
++#include <helpers/BaseSerialInterface.h>
++
++#include "CompanionProtocol.h"
++#include "FSCommon.h"
++#include "PowerStatus.h"
++#include "gps/RTC.h"
++#include "mesh/NodeDB.h"
++
++using namespace raumata::protocol;
++
++namespace raumata {
++
++MeshCoreNode::MeshCoreNode(mesh::Radio &radio, mesh::MillisecondClock &ms, mesh::RNG &rng, mesh::RTCClock &rtc,
++                           mesh::PacketManager &mgr, mesh::MeshTables &tables, RadioInterface &meshtasticRadio,
++                           FrameWriter writer)
++    : BaseChatMesh(radio, ms, rng, rtc, mgr, tables), meshtasticRadio_(meshtasticRadio), writer_(std::move(writer))
++{
++    memset(nodeName_, 0, sizeof(nodeName_));
++    strncpy(nodeName_, "Raumata", sizeof(nodeName_) - 1);
++}
++
++void MeshCoreNode::begin()
++{
++    loadIdentity();
++    loadName();
++    loadChannels();
++
++    BaseChatMesh::begin();
++    sendSelfAdvert(true);
++    lastAdvertMs_ = millis();
++}
++
++void MeshCoreNode::loop()
++{
++    BaseChatMesh::loop();
++
++    uint32_t now = millis();
++    if (now - lastAdvertMs_ >= kAdvertIntervalMs) {
++        sendSelfAdvert(true);
++        lastAdvertMs_ = now;
++    }
++}
++
++void MeshCoreNode::loadIdentity()
++{
++    Preferences prefs;
++    if (prefs.begin("raumata", true)) {
++        size_t len = prefs.getBytesLength("mc_id");
++        if (len == PRV_KEY_SIZE + PUB_KEY_SIZE || len == PRV_KEY_SIZE) {
++            uint8_t buf[PRV_KEY_SIZE + PUB_KEY_SIZE];
++            if (prefs.getBytes("mc_id", buf, len) == len) {
++                self_id.readFrom(buf, len);
++                prefs.end();
++                return;
++            }
++        }
++        prefs.end();
++    }
++
++    self_id = mesh::LocalIdentity(getRNG());
++
++    if (prefs.begin("raumata", false)) {
++        uint8_t buf[PRV_KEY_SIZE + PUB_KEY_SIZE];
++        size_t len = self_id.writeTo(buf, sizeof(buf));
++        prefs.putBytes("mc_id", buf, len);
++        prefs.end();
++    }
++}
++
++void MeshCoreNode::loadName()
++{
++    Preferences prefs;
++    if (prefs.begin("raumata", true)) {
++        String saved = prefs.getString("mc_name", "");
++        prefs.end();
++        if (saved.length() > 0) {
++            strncpy(nodeName_, saved.c_str(), sizeof(nodeName_) - 1);
++            nodeName_[sizeof(nodeName_) - 1] = 0;
++            return;
++        }
++    }
++
++    const char *source = owner.long_name[0] ? owner.long_name : owner.short_name;
++    if (source[0]) {
++        strncpy(nodeName_, source, sizeof(nodeName_) - 1);
++        nodeName_[sizeof(nodeName_) - 1] = 0;
++    }
++}
++
++void MeshCoreNode::loadChannels()
++{
++    bool loaded = false;
++
++    Preferences prefs;
++    if (prefs.begin("raumata", true)) {
++        size_t len = prefs.getBytesLength("mc_ch");
++        if (len == sizeof(ChannelDetails) * MAX_GROUP_CHANNELS) {
++            ChannelDetails channels[MAX_GROUP_CHANNELS];
++            if (prefs.getBytes("mc_ch", channels, len) == len) {
++                for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
++                    if (channels[i].name[0]) {
++                        setChannel(i, channels[i]);
++                        loaded = true;
++                    }
++                }
++            }
++        }
++        prefs.end();
++    }
++
++    if (!loaded) {
++        addChannel("Public", RAUMATA_PUBLIC_GROUP_PSK);
++    }
++}
++
++void MeshCoreNode::saveChannels()
++{
++    ChannelDetails channels[MAX_GROUP_CHANNELS];
++    memset(channels, 0, sizeof(channels));
++    for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
++        getChannel(i, channels[i]);
++    }
++
++    Preferences prefs;
++    if (prefs.begin("raumata", false)) {
++        prefs.putBytes("mc_ch", channels, sizeof(channels));
++        prefs.end();
++    }
++}
++
++void MeshCoreNode::saveName()
++{
++    Preferences prefs;
++    if (prefs.begin("raumata", false)) {
++        prefs.putString("mc_name", nodeName_);
++        prefs.end();
++    }
++}
++
++void MeshCoreNode::setNodeName(const char *name)
++{
++    strncpy(nodeName_, name, sizeof(nodeName_) - 1);
++    nodeName_[sizeof(nodeName_) - 1] = 0;
++    saveName();
++}
++
++void MeshCoreNode::sendSelfAdvert(bool flood)
++{
++    mesh::Packet *packet = createSelfAdvert(nodeName_);
++    if (!packet) {
++        return;
++    }
++    if (flood) {
++        sendFlood(packet);
++    } else {
++        sendZeroHop(packet);
++    }
++}
++
++bool MeshCoreNode::enqueueMessage(const QueuedMessage &message)
++{
++    uint8_t next = static_cast<uint8_t>((msgHead_ + 1) % kMessageQueueSize);
++    if (next == msgTail_) {
++        // Drop the oldest queued message rather than the new one.
++        msgTail_ = static_cast<uint8_t>((msgTail_ + 1) % kMessageQueueSize);
++    }
++    messages_[msgHead_] = message;
++    msgHead_ = next;
++    return true;
++}
++
++bool MeshCoreNode::popMessage(QueuedMessage &message)
++{
++    if (msgTail_ == msgHead_) {
++        return false;
++    }
++    message = messages_[msgTail_];
++    msgTail_ = static_cast<uint8_t>((msgTail_ + 1) % kMessageQueueSize);
++    return true;
++}
++
++void MeshCoreNode::onDiscoveredContact(ContactInfo &contact, bool isNew, uint8_t pathLen, const uint8_t *path)
++{
++    (void)contact;
++    (void)isNew;
++    (void)pathLen;
++    (void)path;
++}
++
++ContactInfo *MeshCoreNode::processAck(const uint8_t *data)
++{
++    (void)data;
++    return nullptr;
++}
++
++void MeshCoreNode::onContactPathUpdated(const ContactInfo &contact)
++{
++    (void)contact;
++}
++
++void MeshCoreNode::onMessageRecv(const ContactInfo &contact, mesh::Packet *packet, uint32_t senderTimestamp,
++                                 const char *text)
++{
++    QueuedMessage message = {};
++    message.type = 1;
++    message.snr4 = static_cast<int8_t>(packet ? packet->getSNR() * 4.0f : 0);
++    message.channel = 0;
++    message.pathLen = packet && packet->isRouteFlood() ? static_cast<uint8_t>(packet->path_len) : 0xFF;
++    message.txtType = RAUMATA_TXT_TYPE_PLAIN;
++    message.timestamp = senderTimestamp;
++    memcpy(message.pubKey, contact.id.pub_key, sizeof(message.pubKey));
++
++    size_t len = strlen(text);
++    if (len > MAX_TEXT_LEN) {
++        len = MAX_TEXT_LEN;
++    }
++    message.textLen = static_cast<uint16_t>(len);
++    memcpy(message.text, text, len);
++    message.text[len] = 0;
++
++    enqueueMessage(message);
++}
++
++void MeshCoreNode::onCommandDataRecv(const ContactInfo &contact, mesh::Packet *packet, uint32_t senderTimestamp,
++                                     const char *text)
++{
++    (void)contact;
++    (void)packet;
++    (void)senderTimestamp;
++    (void)text;
++}
++
++void MeshCoreNode::onCLICommandRecv(const ContactInfo &contact, mesh::Packet *packet, uint32_t senderTimestamp,
++                                    const char *text, char *reply)
++{
++    (void)contact;
++    (void)packet;
++    (void)senderTimestamp;
++    (void)text;
++    if (reply) {
++        reply[0] = 0;
++    }
++}
++
++void MeshCoreNode::onSignedMessageRecv(const ContactInfo &contact, mesh::Packet *packet, uint32_t senderTimestamp,
++                                       const uint8_t *senderPrefix, const char *text)
++{
++    (void)contact;
++    (void)packet;
++    (void)senderTimestamp;
++    (void)senderPrefix;
++    (void)text;
++}
++
++uint32_t MeshCoreNode::calcFloodTimeoutMillisFor(uint32_t pktAirtimeMillis) const
++{
++    return pktAirtimeMillis * 16 + 500;
++}
++
++uint32_t MeshCoreNode::calcDirectTimeoutMillisFor(uint32_t pktAirtimeMillis, uint8_t pathLen) const
++{
++    return (pktAirtimeMillis + 250) * (pathLen + 1) * 6;
++}
++
++void MeshCoreNode::onSendTimeout() {}
++
++void MeshCoreNode::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packet *packet, uint32_t timestamp,
++                                        const char *text)
++{
++    int channelIdx = findChannelIdx(channel);
++    if (channelIdx < 0) {
++        channelIdx = 0;
++    }
++
++    QueuedMessage message = {};
++    message.type = 0;
++    message.snr4 = static_cast<int8_t>(packet ? packet->getSNR() * 4.0f : 0);
++    message.channel = static_cast<uint8_t>(channelIdx);
++    message.pathLen = packet && packet->isRouteFlood() ? static_cast<uint8_t>(packet->path_len) : 0xFF;
++    message.txtType = RAUMATA_TXT_TYPE_PLAIN;
++    message.timestamp = timestamp;
++
++    size_t len = strlen(text);
++    if (len > MAX_TEXT_LEN) {
++        len = MAX_TEXT_LEN;
++    }
++    message.textLen = static_cast<uint16_t>(len);
++    memcpy(message.text, text, len);
++    message.text[len] = 0;
++
++    enqueueMessage(message);
++}
++
++uint8_t MeshCoreNode::onContactRequest(const ContactInfo &contact, uint32_t senderTimestamp, const uint8_t *data,
++                                       uint8_t len, uint8_t *reply)
++{
++    (void)contact;
++    (void)senderTimestamp;
++    (void)data;
++    (void)len;
++    (void)reply;
++    return 0;
++}
++
++void MeshCoreNode::onContactResponse(const ContactInfo &contact, const uint8_t *data, uint8_t len)
++{
++    (void)contact;
++    (void)data;
++    (void)len;
++}
++
++void MeshCoreNode::writeOK()
++{
++    uint8_t frame = RESP_CODE_OK;
++    writer_(&frame, 1);
++}
++
++void MeshCoreNode::writeError(uint8_t code)
++{
++    uint8_t frame[2] = {RESP_CODE_ERR, code};
++    writer_(frame, sizeof(frame));
++}
++
++void MeshCoreNode::writeSelfInfo()
++{
++    uint8_t frame[MAX_FRAME_SIZE];
++    int i = 0;
++
++    frame[i++] = RESP_CODE_SELF_INFO;
++    frame[i++] = ADV_TYPE_CHAT;
++    frame[i++] = 20; // TX power
++    frame[i++] = 22; // max TX power
++
++    memcpy(&frame[i], self_id.pub_key, PUB_KEY_SIZE);
++    i += PUB_KEY_SIZE;
++
++    int32_t lat = 0;
++    int32_t lon = 0;
++    memcpy(&frame[i], &lat, 4);
++    i += 4;
++    memcpy(&frame[i], &lon, 4);
++    i += 4;
++
++    frame[i++] = 0; // multi acks
++    frame[i++] = 0; // advert location policy
++    frame[i++] = 0; // telemetry modes
++    frame[i++] = 0; // manual add contacts
++
++    uint32_t freq = static_cast<uint32_t>(meshtasticRadio_.getFreq() * 1000.0f);
++    uint32_t bw = static_cast<uint32_t>(meshtasticRadio_.getBandwidthKHz() * 1000.0f);
++    memcpy(&frame[i], &freq, 4);
++    i += 4;
++    memcpy(&frame[i], &bw, 4);
++    i += 4;
++    frame[i++] = meshtasticRadio_.getSpreadFactorValue();
++    frame[i++] = meshtasticRadio_.getCodingRateValue();
++
++    size_t nameLen = strlen(nodeName_);
++    if (i + nameLen > sizeof(frame)) {
++        nameLen = sizeof(frame) - i;
++    }
++    memcpy(&frame[i], nodeName_, nameLen);
++    i += nameLen;
++
++    writer_(frame, i);
++}
++
++void MeshCoreNode::writeDeviceInfo()
++{
++    uint8_t frame[MAX_FRAME_SIZE];
++    int i = 0;
++
++    frame[i++] = RESP_CODE_DEVICE_INFO;
++    frame[i++] = FIRMWARE_VER_CODE;
++    frame[i++] = MAX_CONTACTS / 2;
++    frame[i++] = MAX_GROUP_CHANNELS;
++
++    uint32_t pin = 0;
++    memcpy(&frame[i], &pin, 4);
++    i += 4;
++
++    memset(&frame[i], 0, 12);
++    StrHelper::strzcpy(reinterpret_cast<char *>(&frame[i]), FIRMWARE_BUILD_DATE, 12);
++    i += 12;
++
++    StrHelper::strzcpy(reinterpret_cast<char *>(&frame[i]), MANUFACTURER_NAME, 40);
++    i += 40;
++
++    StrHelper::strzcpy(reinterpret_cast<char *>(&frame[i]), FIRMWARE_VERSION, 20);
++    i += 20;
++
++    frame[i++] = 0; // repeat disabled
++    frame[i++] = 0; // path hash mode
++
++    writer_(frame, i);
++}
++
++void MeshCoreNode::writeContactFrame(uint8_t code, const ContactInfo &contact)
++{
++    uint8_t frame[MAX_FRAME_SIZE];
++    int i = 0;
++
++    frame[i++] = code;
++    memcpy(&frame[i], contact.id.pub_key, PUB_KEY_SIZE);
++    i += PUB_KEY_SIZE;
++    frame[i++] = contact.type;
++    frame[i++] = contact.flags;
++    frame[i++] = contact.out_path_len;
++    memcpy(&frame[i], contact.out_path, MAX_PATH_SIZE);
++    i += MAX_PATH_SIZE;
++    StrHelper::strzcpy(reinterpret_cast<char *>(&frame[i]), contact.name, 32);
++    i += 32;
++    memcpy(&frame[i], &contact.last_advert_timestamp, 4);
++    i += 4;
++    memcpy(&frame[i], &contact.gps_lat, 4);
++    i += 4;
++    memcpy(&frame[i], &contact.gps_lon, 4);
++    i += 4;
++    memcpy(&frame[i], &contact.lastmod, 4);
++    i += 4;
++
++    writer_(frame, i);
++}
++
++void MeshCoreNode::writeContacts()
++{
++    uint8_t start[5];
++    start[0] = RESP_CODE_CONTACTS_START;
++    uint32_t count = static_cast<uint32_t>(getNumContacts());
++    memcpy(&start[1], &count, 4);
++    writer_(start, sizeof(start));
++
++    ContactInfo contact;
++    int slots = getTotalContactSlots();
++    for (int idx = 0; idx < slots; idx++) {
++        if (!getContactByIdx(idx, contact)) {
++            break;
++        }
++        if (contact.type == 0 || contact.name[0] == 0) {
++            continue;
++        }
++        writeContactFrame(RESP_CODE_CONTACT, contact);
++    }
++
++    uint8_t end[5];
++    end[0] = RESP_CODE_END_OF_CONTACTS;
++    uint32_t lastMod = 0;
++    memcpy(&end[1], &lastMod, 4);
++    writer_(end, sizeof(end));
++}
++
++void MeshCoreNode::writeChannel(uint8_t idx)
++{
++    ChannelDetails channel;
++    if (!getChannel(idx, channel) || channel.name[0] == 0) {
++        writeError(ERR_CODE_NOT_FOUND);
++        return;
++    }
++
++    uint8_t frame[MAX_FRAME_SIZE];
++    int i = 0;
++    frame[i++] = RESP_CODE_CHANNEL_INFO;
++    frame[i++] = idx;
++    StrHelper::strzcpy(reinterpret_cast<char *>(&frame[i]), channel.name, 32);
++    i += 32;
++    memcpy(&frame[i], channel.channel.secret, 16);
++    i += 16;
++    writer_(frame, i);
++}
++
++void MeshCoreNode::writeNextMessage()
++{
++    QueuedMessage message;
++    if (!popMessage(message)) {
++        uint8_t frame = RESP_CODE_NO_MORE_MESSAGES;
++        writer_(&frame, 1);
++        return;
++    }
++
++    uint8_t frame[MAX_FRAME_SIZE];
++    int i = 0;
++
++    if (message.type == 0) {
++        frame[i++] = RESP_CODE_CHANNEL_MSG_RECV_V3;
++        frame[i++] = static_cast<uint8_t>(message.snr4);
++        frame[i++] = 0;
++        frame[i++] = 0;
++        frame[i++] = message.channel;
++        frame[i++] = message.pathLen;
++        frame[i++] = message.txtType;
++        memcpy(&frame[i], &message.timestamp, 4);
++        i += 4;
++    } else {
++        frame[i++] = RESP_CODE_CONTACT_MSG_RECV_V3;
++        frame[i++] = static_cast<uint8_t>(message.snr4);
++        frame[i++] = 0;
++        frame[i++] = 0;
++        memcpy(&frame[i], message.pubKey, sizeof(message.pubKey));
++        i += sizeof(message.pubKey);
++        frame[i++] = message.pathLen;
++        frame[i++] = message.txtType;
++        memcpy(&frame[i], &message.timestamp, 4);
++        i += 4;
++    }
++
++    size_t textLen = message.textLen;
++    if (i + textLen > sizeof(frame)) {
++        textLen = sizeof(frame) - i;
++    }
++    memcpy(&frame[i], message.text, textLen);
++    i += textLen;
++
++    writer_(frame, i);
++}
++
++void MeshCoreNode::handleCompanionFrame(const uint8_t *frame, size_t len)
++{
++    if (len < 1) {
++        return;
++    }
++    handleCommand(frame[0], frame, len);
++}
++
++void MeshCoreNode::handleCommand(uint8_t command, const uint8_t *frame, size_t len)
++{
++    switch (command) {
++    case CMD_DEVICE_QUERY:
++        writeDeviceInfo();
++        break;
++
++    case CMD_APP_START:
++        writeSelfInfo();
++        break;
++
++    case CMD_GET_DEVICE_TIME: {
++        uint8_t reply[5];
++        reply[0] = RESP_CODE_CURR_TIME;
++        uint32_t now = getRTCClock()->getCurrentTime();
++        memcpy(&reply[1], &now, 4);
++        writer_(reply, sizeof(reply));
++        break;
++    }
++
++    case CMD_SET_DEVICE_TIME:
++        if (len >= 5) {
++            uint32_t now;
++            memcpy(&now, &frame[1], 4);
++            getRTCClock()->setCurrentTime(now);
++            writeOK();
++        } else {
++            writeError(ERR_CODE_ILLEGAL_ARG);
++        }
++        break;
++
++    case CMD_SEND_SELF_ADVERT:
++        sendSelfAdvert(len >= 2 && frame[1] == 1);
++        writeOK();
++        break;
++
++    case CMD_SET_ADVERT_NAME:
++        if (len >= 2) {
++            char name[32];
++            size_t nameLen = len - 1;
++            if (nameLen > sizeof(name) - 1) {
++                nameLen = sizeof(name) - 1;
++            }
++            memcpy(name, &frame[1], nameLen);
++            name[nameLen] = 0;
++            setNodeName(name);
++            writeOK();
++        } else {
++            writeError(ERR_CODE_ILLEGAL_ARG);
++        }
++        break;
++
++    case CMD_GET_CONTACTS:
++        writeContacts();
++        break;
++
++    case CMD_GET_CONTACT_BY_KEY:
++        if (len >= 1 + PUB_KEY_SIZE) {
++            ContactInfo *contact = lookupContactByPubKey(&frame[1], PUB_KEY_SIZE);
++            if (contact) {
++                writeContactFrame(RESP_CODE_CONTACT, *contact);
++            } else {
++                writeError(ERR_CODE_NOT_FOUND);
++            }
++        } else {
++            writeError(ERR_CODE_ILLEGAL_ARG);
++        }
++        break;
++
++    case CMD_GET_CHANNEL:
++        if (len >= 2) {
++            writeChannel(frame[1]);
++        } else {
++            writeError(ERR_CODE_ILLEGAL_ARG);
++        }
++        break;
++
++    case CMD_SET_CHANNEL:
++        if (len >= 2 + 32 + 16) {
++            uint8_t idx = frame[1];
++            ChannelDetails channel = {};
++            StrHelper::strzcpy(channel.name, reinterpret_cast<const char *>(&frame[2]), 32);
++            memcpy(channel.channel.secret, &frame[2 + 32], 16);
++            if (setChannel(idx, channel)) {
++                saveChannels();
++                writeOK();
++            } else {
++                writeError(ERR_CODE_NOT_FOUND);
++            }
++        } else {
++            writeError(ERR_CODE_ILLEGAL_ARG);
++        }
++        break;
++
++    case CMD_SEND_CHANNEL_TXT_MSG:
++        if (len >= 7) {
++            uint8_t channelIdx = frame[2];
++            uint32_t timestamp;
++            memcpy(&timestamp, &frame[3], 4);
++
++            char text[MAX_TEXT_LEN + 1];
++            size_t textLen = len - 7;
++            if (textLen > MAX_TEXT_LEN) {
++                textLen = MAX_TEXT_LEN;
++            }
++            memcpy(text, &frame[7], textLen);
++            text[textLen] = 0;
++
++            ChannelDetails channel;
++            if (getChannel(channelIdx, channel) && channel.name[0]) {
++                if (sendGroupMessage(timestamp, channel.channel, nodeName_, text, textLen)) {
++                    writeOK();
++                } else {
++                    writeError(ERR_CODE_TABLE_FULL);
++                }
++            } else {
++                writeError(ERR_CODE_NOT_FOUND);
++            }
++        } else {
++            writeError(ERR_CODE_ILLEGAL_ARG);
++        }
++        break;
++
++    case CMD_SEND_TXT_MSG:
++        if (len >= 14) {
++            uint8_t attempt = frame[2];
++            uint32_t timestamp;
++            memcpy(&timestamp, &frame[3], 4);
++            ContactInfo *contact = lookupContactByPubKey(&frame[7], 6);
++            if (!contact) {
++                writeError(ERR_CODE_NOT_FOUND);
++                break;
++            }
++
++            char text[MAX_TEXT_LEN + 1];
++            size_t textLen = len - 13;
++            if (textLen > MAX_TEXT_LEN) {
++                textLen = MAX_TEXT_LEN;
++            }
++            memcpy(text, &frame[13], textLen);
++            text[textLen] = 0;
++
++            uint32_t expectedAck = 0;
++            uint32_t estTimeout = 0;
++            int result = sendMessage(*contact, timestamp, attempt, text, expectedAck, estTimeout);
++            if (result == MSG_SEND_FAILED) {
++                writeError(ERR_CODE_TABLE_FULL);
++            } else {
++                uint8_t reply[10];
++                reply[0] = RESP_CODE_SENT;
++                reply[1] = result == MSG_SEND_SENT_FLOOD ? 1 : 0;
++                memcpy(&reply[2], &expectedAck, 4);
++                memcpy(&reply[6], &estTimeout, 4);
++                writer_(reply, sizeof(reply));
++            }
++        } else {
++            writeError(ERR_CODE_ILLEGAL_ARG);
++        }
++        break;
++
++    case CMD_SYNC_NEXT_MESSAGE:
++        writeNextMessage();
++        break;
++
++    case CMD_GET_BATT_AND_STORAGE: {
++        uint8_t reply[11];
++        int i = 0;
++        reply[i++] = RESP_CODE_BATT_AND_STORAGE;
++        uint16_t battery = powerStatus ? static_cast<uint16_t>(powerStatus->getBatteryVoltageMv()) : 0;
++        uint32_t used = static_cast<uint32_t>(FSCom.usedBytes() / 1024);
++        uint32_t total = static_cast<uint32_t>(FSCom.totalBytes() / 1024);
++        memcpy(&reply[i], &battery, 2);
++        i += 2;
++        memcpy(&reply[i], &used, 4);
++        i += 4;
++        memcpy(&reply[i], &total, 4);
++        i += 4;
++        writer_(reply, i);
++        break;
++    }
++
++    case CMD_REBOOT:
++        if (len >= 7 && memcmp(&frame[1], "reboot", 6) == 0) {
++            ESP.restart();
++        } else {
++            writeError(ERR_CODE_ILLEGAL_ARG);
++        }
++        break;
++
++    case CMD_SET_RADIO_PARAMS:
++    case CMD_SET_RADIO_TX_POWER:
++        // The PHY is shared with Meshtastic and configured by its radio settings.
++        writeError(ERR_CODE_UNSUPPORTED_CMD);
++        break;
++
++    default:
++        writeError(ERR_CODE_UNSUPPORTED_CMD);
++        break;
++    }
++}
++
++} // namespace raumata
++
++#endif // RAUMATA_DUAL_PROTOCOL
+diff --git a/src/raumata/MeshCoreNode.h b/src/raumata/MeshCoreNode.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..0e3e7166d0b84b18f4960ea19249f9c2da337b29
+--- /dev/null
++++ b/src/raumata/MeshCoreNode.h
+@@ -0,0 +1,97 @@
++#pragma once
++
++#include <Arduino.h>
++#include <Preferences.h>
++#include <functional>
++
++#include <helpers/BaseChatMesh.h>
++
++#include "mesh/RadioInterface.h"
++
++namespace raumata {
++
++class MeshCoreNode : public BaseChatMesh
++{
++  public:
++    using FrameWriter = std::function<void(const uint8_t *frame, size_t len)>;
++
++    MeshCoreNode(mesh::Radio &radio, mesh::MillisecondClock &ms, mesh::RNG &rng, mesh::RTCClock &rtc,
++                 mesh::PacketManager &mgr, mesh::MeshTables &tables, RadioInterface &meshtasticRadio,
++                 FrameWriter writer);
++
++    void begin();
++    void loop();
++
++    void handleCompanionFrame(const uint8_t *frame, size_t len);
++    const char *nodeName() const { return nodeName_; }
++    void setNodeName(const char *name);
++
++  protected:
++    // BaseChatMesh hooks
++    void onDiscoveredContact(ContactInfo &contact, bool isNew, uint8_t pathLen, const uint8_t *path) override;
++    ContactInfo *processAck(const uint8_t *data) override;
++    void onContactPathUpdated(const ContactInfo &contact) override;
++    void onMessageRecv(const ContactInfo &contact, mesh::Packet *pkt, uint32_t senderTimestamp,
++                       const char *text) override;
++    void onCommandDataRecv(const ContactInfo &contact, mesh::Packet *pkt, uint32_t senderTimestamp,
++                           const char *text) override;
++    void onCLICommandRecv(const ContactInfo &contact, mesh::Packet *pkt, uint32_t senderTimestamp,
++                          const char *text, char *reply) override;
++    void onSignedMessageRecv(const ContactInfo &contact, mesh::Packet *pkt, uint32_t senderTimestamp,
++                             const uint8_t *senderPrefix, const char *text) override;
++    uint32_t calcFloodTimeoutMillisFor(uint32_t pktAirtimeMillis) const override;
++    uint32_t calcDirectTimeoutMillisFor(uint32_t pktAirtimeMillis, uint8_t pathLen) const override;
++    void onSendTimeout() override;
++    void onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packet *pkt, uint32_t timestamp,
++                              const char *text) override;
++    uint8_t onContactRequest(const ContactInfo &contact, uint32_t senderTimestamp, const uint8_t *data, uint8_t len,
++                             uint8_t *reply) override;
++    void onContactResponse(const ContactInfo &contact, const uint8_t *data, uint8_t len) override;
++
++  private:
++    static constexpr uint8_t kMessageQueueSize = 8;
++    static constexpr uint32_t kAdvertIntervalMs = 15UL * 60UL * 1000UL;
++
++    struct QueuedMessage {
++        uint8_t type; // 0 = channel, 1 = contact
++        int8_t snr4;
++        uint8_t channel;
++        uint8_t pathLen;
++        uint8_t txtType;
++        uint32_t timestamp;
++        uint8_t pubKey[6];
++        uint16_t textLen;
++        char text[MAX_TEXT_LEN + 1];
++    };
++
++    RadioInterface &meshtasticRadio_;
++    FrameWriter writer_;
++    char nodeName_[32];
++    QueuedMessage messages_[kMessageQueueSize];
++    uint8_t msgHead_ = 0;
++    uint8_t msgTail_ = 0;
++    uint32_t lastAdvertMs_ = 0;
++
++    void loadIdentity();
++    void loadName();
++    void loadChannels();
++    void saveChannels();
++    void saveName();
++
++    bool enqueueMessage(const QueuedMessage &message);
++    bool popMessage(QueuedMessage &message);
++
++    void writeOK();
++    void writeError(uint8_t code);
++    void writeSelfInfo();
++    void writeDeviceInfo();
++    void writeContacts();
++    void writeChannel(uint8_t idx);
++    void writeNextMessage();
++    void writeContactFrame(uint8_t code, const ContactInfo &contact);
++    void sendSelfAdvert(bool flood);
++
++    void handleCommand(uint8_t command, const uint8_t *frame, size_t len);
++};
++
++} // namespace raumata
+diff --git a/src/raumata/MeshCoreRadio.cpp b/src/raumata/MeshCoreRadio.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..213304a35a003d703e78b5816195e2953a19f67a
+--- /dev/null
++++ b/src/raumata/MeshCoreRadio.cpp
+@@ -0,0 +1,159 @@
++#ifdef RAUMATA_DUAL_PROTOCOL
++#include "MeshCoreRadio.h"
++
++#include <cstring>
++
++namespace raumata {
++
++MeshCoreRadio::MeshCoreRadio(RadioInterface &radio) : radio_(radio) {}
++
++void MeshCoreRadio::begin()
++{
++    radio_.setRawPacketHandler(this);
++}
++
++bool MeshCoreRadio::handleRawPacket(const uint8_t *data, size_t len, float snr, float rssi)
++{
++    if (len < kMagicLen + 1 || memcmp(data, kMagic, kMagicLen) != 0) {
++        return false;
++    }
++
++    uint16_t payloadLen = static_cast<uint16_t>(len - kMagicLen);
++    if (payloadLen > MAX_TRANS_UNIT) {
++        return true; // ours, but malformed; consume so Meshtastic never sees it
++    }
++
++    uint8_t head = head_.load(std::memory_order_relaxed);
++    uint8_t next = static_cast<uint8_t>((head + 1) % kQueueSize);
++    if (next == tail_.load(std::memory_order_acquire)) {
++        return true; // queue full: drop the frame
++    }
++
++    Frame &frame = queue_[head];
++    frame.len = payloadLen;
++    frame.snr = snr;
++    frame.rssi = rssi;
++    memcpy(frame.data, data + kMagicLen, payloadLen);
++    head_.store(next, std::memory_order_release);
++    return true;
++}
++
++int MeshCoreRadio::recvRaw(uint8_t *bytes, int sz)
++{
++    uint8_t tail = tail_.load(std::memory_order_relaxed);
++    if (tail == head_.load(std::memory_order_acquire)) {
++        return 0;
++    }
++
++    Frame &frame = queue_[tail];
++    int copyLen = frame.len < static_cast<uint16_t>(sz) ? frame.len : sz;
++    memcpy(bytes, frame.data, copyLen);
++    lastSnr_ = frame.snr;
++    lastRssi_ = frame.rssi;
++    tail_.store(static_cast<uint8_t>((tail + 1) % kQueueSize), std::memory_order_release);
++    return copyLen;
++}
++
++uint32_t MeshCoreRadio::getEstAirtimeFor(int len_bytes)
++{
++    return radio_.getPacketTime(static_cast<uint32_t>(len_bytes) + kMagicLen, false);
++}
++
++float MeshCoreRadio::packetScore(float snr, int packet_len)
++{
++    float snrScore = (snr + 20.0f) / 20.0f;
++    if (snrScore < 0.0f) {
++        snrScore = 0.0f;
++    } else if (snrScore > 1.0f) {
++        snrScore = 1.0f;
++    }
++
++    float lengthScore = 1.0f - (static_cast<float>(packet_len) / 256.0f);
++    if (lengthScore < 0.0f) {
++        lengthScore = 0.0f;
++    }
++    return snrScore * lengthScore;
++}
++
++bool MeshCoreRadio::startSendRaw(const uint8_t *bytes, int len)
++{
++    if (len <= 0 || len > MAX_TRANS_UNIT || pendingLen_ != 0 || sending_) {
++        return false;
++    }
++
++    pendingLen_ = static_cast<uint16_t>(kMagicLen + len);
++    memcpy(pending_, kMagic, kMagicLen);
++    memcpy(pending_ + kMagicLen, bytes, len);
++
++    if (radio_.rawTransmit(pending_, pendingLen_)) {
++        pendingLen_ = 0;
++        sending_ = true;
++    } else {
++        // The Meshtastic stack is using the radio.  Keep the frame and let
++        // loop() retry; report success so MeshCore does not free it.
++        sending_ = false;
++    }
++
++    return true;
++}
++
++bool MeshCoreRadio::tryStartPending()
++{
++    if (pendingLen_ == 0 || sending_) {
++        return false;
++    }
++    if (!radio_.rawTransmit(pending_, pendingLen_)) {
++        return false;
++    }
++    pendingLen_ = 0;
++    sending_ = true;
++    return true;
++}
++
++bool MeshCoreRadio::isSendComplete()
++{
++    if (pendingLen_ != 0) {
++        return false;
++    }
++    return sending_ && radio_.rawTransmitDone();
++}
++
++void MeshCoreRadio::onSendFinished()
++{
++    radio_.rawTransmitFinished();
++    sending_ = false;
++}
++
++bool MeshCoreRadio::isInRecvMode() const
++{
++    return !sending_ && pendingLen_ == 0 && !radio_.rawTransmitActive();
++}
++
++bool MeshCoreRadio::isReceiving()
++{
++    return !sending_ && pendingLen_ == 0 && !radio_.rawTransmitActive();
++}
++
++void MeshCoreRadio::loop()
++{
++    tryStartPending();
++}
++
++int MeshCoreRadio::getNoiseFloor() const
++{
++    return radio_.getNoiseFloor();
++}
++
++float MeshCoreRadio::getLastRSSI() const
++{
++    return lastRssi_;
++}
++
++float MeshCoreRadio::getLastSNR() const
++{
++    return lastSnr_;
++}
++
++} // namespace raumata
++
++#endif // RAUMATA_DUAL_PROTOCOL
+diff --git a/src/raumata/MeshCoreRadio.h b/src/raumata/MeshCoreRadio.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..5fd9bbfe3452a634804184eb034a0587681d1bbb
+--- /dev/null
++++ b/src/raumata/MeshCoreRadio.h
+@@ -0,0 +1,72 @@
++#pragma once
++
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++
++#include "Mesh.h"
++#include "mesh/RadioInterface.h"
++
++namespace raumata {
++
++/**
++ * mesh::Radio implementation that shares the Meshtastic LoRa radio.
++ *
++ * MeshCore frames are distinguished from Meshtastic frames by a 4-byte
++ * transport tag prepended on air.  The tag is stripped before the frame is
++ * handed to MeshCore, so MeshCore's own packet format is unchanged.
++ */
++class MeshCoreRadio : public mesh::Radio, public RawPacketHandler
++{
++  public:
++    static constexpr uint8_t kMagic[4] = {'R', 'A', 'U', 'M'};
++    static constexpr uint8_t kMagicLen = sizeof(kMagic);
++
++    explicit MeshCoreRadio(RadioInterface &radio);
++
++    // mesh::Radio
++    void begin() override;
++    int recvRaw(uint8_t *bytes, int sz) override;
++    uint32_t getEstAirtimeFor(int len_bytes) override;
++    float packetScore(float snr, int packet_len) override;
++    bool startSendRaw(const uint8_t *bytes, int len) override;
++    bool isSendComplete() override;
++    void onSendFinished() override;
++    bool isInRecvMode() const override;
++    bool isReceiving() override;
++    void loop() override;
++    int getNoiseFloor() const override;
++    float getLastRSSI() const override;
++    float getLastSNR() const override;
++
++    // RawPacketHandler
++    bool handleRawPacket(const uint8_t *data, size_t len, float snr, float rssi) override;
++
++  private:
++    static constexpr uint8_t kQueueSize = 4;
++
++    struct Frame {
++        uint16_t len;
++        float snr;
++        float rssi;
++        uint8_t data[MAX_TRANS_UNIT];
++    };
++
++    RadioInterface &radio_;
++    Frame queue_[kQueueSize];
++    std::atomic<uint8_t> head_{0};
++    std::atomic<uint8_t> tail_{0};
++    volatile float lastSnr_ = 0;
++    volatile float lastRssi_ = 0;
++
++    // MeshCore's Dispatcher expects startSendRaw() to be non-blocking.  If the
++    // Meshtastic stack currently owns the radio, keep the frame here and retry
++    // from loop() instead of dropping it.
++    uint8_t pending_[kMagicLen + MAX_TRANS_UNIT];
++    uint16_t pendingLen_ = 0;
++    bool sending_ = false;
++
++    bool tryStartPending();
++};
++
++} // namespace raumata

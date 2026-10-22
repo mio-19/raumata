@@ -1,0 +1,444 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mio <mio@mio19.uk>
+Date: Thu, 22 Oct 2026 23:00:40 +1100
+Subject: [PATCH] raumata: add USB companion serial mux
+
+Parse both Meshtastic 0x94C3 framing and MeshCore '<' framing on the USB serial port. In dual builds SerialConsole becomes write-only while the mux owns reads; MeshCore mode suppresses Meshtastic debug output so companion apps see a clean frame stream.
+
+diff --git a/src/SerialConsole.cpp b/src/SerialConsole.cpp
+index e24aa3c57483eabf99a1c1946095843011c6053b..88028a4029bdb1f973397b11d8b049d38dca4800 100644
+--- a/src/SerialConsole.cpp
++++ b/src/SerialConsole.cpp
+@@ -6,6 +6,10 @@
+ #include "configuration.h"
+ #include "time.h"
+ 
++#ifdef RAUMATA_DUAL_PROTOCOL
++#include "raumata/RaumataProtocol.h"
++#endif
++
+ #if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
+ #define IS_USB_SERIAL
+ #ifdef SERIAL_HAS_ON_RECEIVE
+@@ -80,6 +84,12 @@ SerialConsole::SerialConsole() : StreamAPI(&Port), RedirectablePrint(&Port), con
+ 
+ int32_t SerialConsole::runOnce()
+ {
++#ifdef RAUMATA_DUAL_PROTOCOL
++    if (raumata::serialMuxActive()) {
++        return runOnceWriteOnly();
++    }
++#endif
++
+ #ifdef HELTEC_MESH_SOLAR
+     // After enabling the mesh solar serial port module configuration, command processing is handled by the serial port module.
+     if (moduleConfig.serial.enabled && moduleConfig.serial.override_console_serial_port &&
+@@ -129,6 +139,7 @@ bool SerialConsole::handleToRadio(const uint8_t *buf, size_t len)
+ {
+     // only talk to the API once the configuration has been loaded and we're sure the serial port is not disabled.
+     if (config.has_lora && config.security.serial_enabled) {
++        meshCoreSerialMode = false;
+         // Switch to protobufs for log messages
+         usingProtobufs = true;
+         canWrite = true;
+@@ -139,8 +150,18 @@ bool SerialConsole::handleToRadio(const uint8_t *buf, size_t len)
+     }
+ }
+ 
++void SerialConsole::setMeshCoreSerialMode(bool enabled)
++{
++    meshCoreSerialMode = enabled;
++    canWrite = !enabled;
++}
++
+ void SerialConsole::log_to_serial(const char *logLevel, const char *format, va_list arg)
+ {
++    if (meshCoreSerialMode) {
++        return;
++    }
++
+     if (usingProtobufs && config.security.debug_log_api_enabled) {
+         meshtastic_LogRecord_Level ll = RedirectablePrint::getLogLevel(logLevel);
+         auto thread = concurrency::OSThread::currentThread;
+diff --git a/src/SerialConsole.h b/src/SerialConsole.h
+index 98577e4bcedbd0f57c3a846814a25e5a9c7f6d51..c35f8ba993c81a18491b92a10a72100b9b472a2d 100644
+--- a/src/SerialConsole.h
++++ b/src/SerialConsole.h
+@@ -34,6 +34,10 @@ class SerialConsole : public StreamAPI, public RedirectablePrint, private concur
+     void flush();
+     void rxInt();
+ 
++    /// MeshCore companion mode suppresses debug text and FromRadio writes so the
++    /// serial port can carry MeshCore's framed protocol.
++    void setMeshCoreSerialMode(bool enabled);
++
+   protected:
+     /// Check the current underlying physical link to see if the client is currently connected
+     virtual bool checkIsConnected() override;
+@@ -42,6 +46,9 @@ class SerialConsole : public StreamAPI, public RedirectablePrint, private concur
+ 
+     /// Possibly switch to protobufs if we see a valid protobuf message
+     virtual void log_to_serial(const char *logLevel, const char *format, va_list arg);
++
++  private:
++    bool meshCoreSerialMode = false;
+ };
+ 
+ // A simple wrapper to allow non class aware code write to the console
+diff --git a/src/mesh/StreamAPI.cpp b/src/mesh/StreamAPI.cpp
+index 2c336287714b9bec9a79b9839953cb002542164f..0d99d9642e81c8d4b57fd8ea5e38593c0a7a12d8 100644
+--- a/src/mesh/StreamAPI.cpp
++++ b/src/mesh/StreamAPI.cpp
+@@ -25,6 +25,13 @@ int32_t StreamAPI::runOncePart(char *buf, uint16_t bufLen)
+     return result;
+ }
+ 
++int32_t StreamAPI::runOnceWriteOnly()
++{
++    writeStream();
++    checkConnectionTimeout();
++    return 5;
++}
++
+ /**
+  * Read any rx chars from the link and call handleRecStream
+  */
+diff --git a/src/mesh/StreamAPI.h b/src/mesh/StreamAPI.h
+index d3ad9ba794d353847f1842ae84ace31f72694865..49059e58369b32ea11ae39a325313a98597de94f 100644
+--- a/src/mesh/StreamAPI.h
++++ b/src/mesh/StreamAPI.h
+@@ -53,6 +53,10 @@ class StreamAPI : public PhoneAPI
+     virtual int32_t runOncePart();
+     virtual int32_t runOncePart(char *buf, uint16_t bufLen);
+ 
++    /// Emit queued FromRadio packets without reading from the underlying stream.
++    /// Used when an external serial mux owns the read side.
++    int32_t runOnceWriteOnly();
++
+     /// Check the current underlying physical link to see if the client is currently connected
+     virtual bool checkIsConnected() override = 0;
+ 
+diff --git a/src/raumata/CompanionSerial.cpp b/src/raumata/CompanionSerial.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..8531152a516307b669e93124e387de120f088299
+--- /dev/null
++++ b/src/raumata/CompanionSerial.cpp
+@@ -0,0 +1,123 @@
++#ifdef RAUMATA_DUAL_PROTOCOL
++#include "CompanionSerial.h"
++
++#include <helpers/BaseSerialInterface.h>
++
++#include "SerialConsole.h"
++
++namespace raumata {
++
++CompanionSerial::CompanionSerial(MeshCoreNode &node, Stream &stream) : node_(node), stream_(stream) {}
++
++void CompanionSerial::begin()
++{
++    state_ = IDLE;
++    frameLen_ = 0;
++    framePos_ = 0;
++}
++
++void CompanionSerial::loop()
++{
++    while (stream_.available() > 0) {
++        int value = stream_.read();
++        if (value < 0) {
++            break;
++        }
++        uint8_t c = static_cast<uint8_t>(value);
++
++        switch (state_) {
++        case IDLE:
++            if (c == 0x94) {
++                state_ = MESHTASTIC_START2;
++            } else if (c == '<') {
++                state_ = MESHCORE_LEN1;
++            }
++            break;
++
++        case MESHTASTIC_START2:
++            if (c == 0xC3) {
++                state_ = MESHTASTIC_LEN1;
++            } else if (c != 0x94) {
++                state_ = IDLE;
++            }
++            break;
++
++        case MESHTASTIC_LEN1:
++            frameLen_ = c;
++            state_ = MESHTASTIC_LEN2;
++            break;
++
++        case MESHTASTIC_LEN2:
++            frameLen_ |= static_cast<uint16_t>(c) << 8;
++            if (frameLen_ > 0 && frameLen_ <= sizeof(frame_)) {
++                framePos_ = 0;
++                state_ = MESHTASTIC_PAYLOAD;
++            } else {
++                state_ = IDLE;
++            }
++            break;
++
++        case MESHTASTIC_PAYLOAD:
++            frame_[framePos_++] = c;
++            if (framePos_ >= frameLen_) {
++                state_ = IDLE;
++                setMeshCoreMode(false);
++                if (console) {
++                    console->handleToRadio(frame_, frameLen_);
++                }
++            }
++            break;
++
++        case MESHCORE_LEN1:
++            frameLen_ = c;
++            state_ = MESHCORE_LEN2;
++            break;
++
++        case MESHCORE_LEN2:
++            frameLen_ |= static_cast<uint16_t>(c) << 8;
++            if (frameLen_ > 0 && frameLen_ <= MAX_FRAME_SIZE && frameLen_ <= sizeof(frame_)) {
++                framePos_ = 0;
++                state_ = MESHCORE_PAYLOAD;
++            } else {
++                state_ = IDLE;
++            }
++            break;
++
++        case MESHCORE_PAYLOAD:
++            frame_[framePos_++] = c;
++            if (framePos_ >= frameLen_) {
++                state_ = IDLE;
++                setMeshCoreMode(true);
++                node_.handleCompanionFrame(frame_, frameLen_);
++            }
++            break;
++        }
++    }
++}
++
++void CompanionSerial::writeFrame(const uint8_t *frame, size_t len)
++{
++    if (len > MAX_FRAME_SIZE) {
++        return;
++    }
++
++    setMeshCoreMode(true);
++
++    uint8_t header[3];
++    header[0] = '>';
++    header[1] = static_cast<uint8_t>(len & 0xFF);
++    header[2] = static_cast<uint8_t>((len >> 8) & 0xFF);
++    stream_.write(header, sizeof(header));
++    stream_.write(frame, len);
++}
++
++void CompanionSerial::setMeshCoreMode(bool enabled)
++{
++    if (console) {
++        console->setMeshCoreSerialMode(enabled);
++    }
++}
++
++} // namespace raumata
++
++#endif // RAUMATA_DUAL_PROTOCOL
+diff --git a/src/raumata/CompanionSerial.h b/src/raumata/CompanionSerial.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..572f402ebd069c3c70e02ed3388fbab2e8d19dc3
+--- /dev/null
++++ b/src/raumata/CompanionSerial.h
+@@ -0,0 +1,47 @@
++#pragma once
++
++#include <Arduino.h>
++
++#include "MeshCoreNode.h"
++
++namespace raumata {
++
++/**
++ * USB-serial multiplexer for the dual-protocol firmware.
++ *
++ * Meshtastic uses 0x94 0xC3 + uint16 length framing; MeshCore companion uses
++ * '<' + uint16 length framing.  In a dual-protocol build this class owns the
++ * read side of the port and hands complete frames to the right stack.
++ */
++class CompanionSerial
++{
++  public:
++    CompanionSerial(MeshCoreNode &node, Stream &stream);
++
++    void begin();
++    void loop();
++    void writeFrame(const uint8_t *frame, size_t len);
++
++  private:
++    enum State : uint8_t {
++        IDLE,
++        MESHTASTIC_START2,
++        MESHTASTIC_LEN1,
++        MESHTASTIC_LEN2,
++        MESHTASTIC_PAYLOAD,
++        MESHCORE_LEN1,
++        MESHCORE_LEN2,
++        MESHCORE_PAYLOAD,
++    };
++
++    MeshCoreNode &node_;
++    Stream &stream_;
++    State state_ = IDLE;
++    uint16_t frameLen_ = 0;
++    uint16_t framePos_ = 0;
++    uint8_t frame_[512];
++
++    void setMeshCoreMode(bool enabled);
++};
++
++} // namespace raumata
+diff --git a/src/raumata/RaumataProtocol.cpp b/src/raumata/RaumataProtocol.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..8c2aa4ababea9a1c9a1bdb3e50ea5fef3e8cceb0
+--- /dev/null
++++ b/src/raumata/RaumataProtocol.cpp
+@@ -0,0 +1,113 @@
++#include "RaumataProtocol.h"
++
++#ifdef RAUMATA_DUAL_PROTOCOL
++
++#include <Arduino.h>
++#include <esp_system.h>
++#include <sys/time.h>
++
++#ifdef ESP32
++#include <esp_random.h>
++#endif
++
++#include <helpers/SimpleMeshTables.h>
++#include <helpers/StaticPoolPacketManager.h>
++
++#include "CompanionSerial.h"
++#include "MeshCoreNode.h"
++#include "MeshCoreRadio.h"
++#include "SerialConsole.h"
++#include "gps/RTC.h"
++
++namespace raumata {
++namespace {
++
++class EspRng : public mesh::RNG
++{
++  public:
++    void random(uint8_t *dest, size_t sz) override
++    {
++#ifdef ESP32
++        esp_fill_random(dest, sz);
++#else
++        for (size_t i = 0; i < sz; i++) {
++            dest[i] = static_cast<uint8_t>(::random(256));
++        }
++#endif
++    }
++};
++
++class MeshtasticClock : public mesh::MillisecondClock
++{
++  public:
++    unsigned long getMillis() override { return millis(); }
++};
++
++class MeshtasticRtc : public mesh::RTCClock
++{
++  public:
++    uint32_t getCurrentTime() override { return getTime(); }
++
++    void setCurrentTime(uint32_t time) override
++    {
++        struct timeval tv = {};
++        tv.tv_sec = static_cast<time_t>(time);
++        tv.tv_usec = 0;
++        settimeofday(&tv, nullptr);
++    }
++};
++
++EspRng gRng;
++MeshtasticClock gClock;
++MeshtasticRtc gRtc;
++SimpleMeshTables gTables;
++
++StaticPoolPacketManager *gManager = nullptr;
++MeshCoreRadio *gRadio = nullptr;
++MeshCoreNode *gNode = nullptr;
++CompanionSerial *gCompanion = nullptr;
++bool gActive = false;
++
++void writeFrame(const uint8_t *frame, size_t len)
++{
++    if (gCompanion) {
++        gCompanion->writeFrame(frame, len);
++    }
++}
++
++} // namespace
++
++void init(RadioInterface *radio)
++{
++    if (gActive || radio == nullptr) {
++        return;
++    }
++
++    gManager = new StaticPoolPacketManager(16);
++    gRadio = new MeshCoreRadio(*radio);
++    gNode = new MeshCoreNode(*gRadio, gClock, gRng, gRtc, *gManager, gTables, *radio, writeFrame);
++    gCompanion = new CompanionSerial(*gNode, Serial);
++
++    gActive = true;
++    gNode->begin();
++    gCompanion->begin();
++}
++
++void loop()
++{
++    if (!gActive) {
++        return;
++    }
++
++    gCompanion->loop();
++    gNode->loop();
++}
++
++bool serialMuxActive()
++{
++    return gActive;
++}
++
++} // namespace raumata
++
++#endif // RAUMATA_DUAL_PROTOCOL
+diff --git a/src/raumata/RaumataProtocol.h b/src/raumata/RaumataProtocol.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..403320e1807aca1a464b023b6ccd4a8c085dbbe0
+--- /dev/null
++++ b/src/raumata/RaumataProtocol.h
+@@ -0,0 +1,17 @@
++#pragma once
++
++#include "mesh/RadioInterface.h"
++
++namespace raumata {
++
++/// Start the MeshCore side of the dual-protocol stack.  Safe to call once,
++/// after the Meshtastic radio has been initialized.
++void init(RadioInterface *radio);
++
++/// Run periodic MeshCore work (radio dispatcher and companion serial).
++void loop();
++
++/// True once the dual-protocol serial mux owns the serial read side.
++bool serialMuxActive();
++
++} // namespace raumata

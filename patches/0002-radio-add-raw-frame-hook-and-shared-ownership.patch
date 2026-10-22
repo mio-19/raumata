@@ -1,0 +1,231 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mio <mio@mio19.uk>
+Date: Thu, 22 Oct 2026 23:00:40 +1100
+Subject: [PATCH] radio: add raw frame hook and shared ownership
+
+Add a raw packet sink and raw transmit path to RadioInterface and RadioLibInterface. MeshCore frames can be consumed before the Meshtastic router sees them, and MeshCore transmits are serialized against the Meshtastic TX queue with a mutex and owner flags.
+
+diff --git a/src/mesh/RadioInterface.h b/src/mesh/RadioInterface.h
+index f0b005e3e3070c5a9b1f12eb460c8de923fb97cf..c596fe7de726578521a32c3e68bcdf2cc504b257 100644
+--- a/src/mesh/RadioInterface.h
++++ b/src/mesh/RadioInterface.h
+@@ -67,6 +67,18 @@ typedef struct {
+ 
+ } RadioBuffer;
+ 
++/**
++ * Optional sink for raw LoRa frames.  Used by the dual-protocol build to hand
++ * MeshCore frames to their own stack without letting the Meshtastic router
++ * parse them.
++ */
++class RawPacketHandler
++{
++  public:
++    virtual ~RawPacketHandler() {}
++    virtual bool handleRawPacket(const uint8_t *data, size_t len, float snr, float rssi) = 0;
++};
++
+ /**
+  * Basic operations all radio chipsets must implement.
+  *
+@@ -231,6 +243,26 @@ class RadioInterface
+      */
+     [[nodiscard]] virtual float getFreq();
+ 
++    /// Current modem parameters, exposed for the MeshCore companion self-info frame.
++    [[nodiscard]] virtual float getBandwidthKHz() const { return bw; }
++    [[nodiscard]] virtual uint8_t getSpreadFactorValue() const { return sf; }
++    [[nodiscard]] virtual uint8_t getCodingRateValue() const { return cr; }
++
++    /// Raw-frame access used by the dual-protocol MeshCore stack.
++    virtual void setRawPacketHandler(RawPacketHandler *handler) { (void)handler; }
++    virtual bool rawTransmit(const uint8_t *data, size_t len)
++    {
++        (void)data;
++        (void)len;
++        return false;
++    }
++    virtual bool rawTransmitDone() const { return false; }
++    virtual void rawTransmitFinished() {}
++    virtual bool rawTransmitActive() const { return false; }
++    virtual int32_t getNoiseFloor() { return -120; }
++    virtual float getLastRssi() const { return 0; }
++    virtual float getLastSnr() const { return 0; }
++
+     /// Some boards (1st gen Pinetab Lora module) have broken IRQ wires, so we need to poll via i2c registers
+     virtual bool isIRQPending() { return false; }
+ 
+diff --git a/src/mesh/RadioLibInterface.cpp b/src/mesh/RadioLibInterface.cpp
+index 335e76a3bc74155eab7eb6946b16f0bc504852ca..656126c30f1a93e46600c3f45425b38c92c3158a 100644
+--- a/src/mesh/RadioLibInterface.cpp
++++ b/src/mesh/RadioLibInterface.cpp
+@@ -94,7 +94,7 @@ bool RadioLibInterface::canSendImmediately()
+     // We wait _if_ we are partially though receiving a packet (rather than just merely waiting for one).
+     // To do otherwise would be doubly bad because not only would we drop the packet that was on the way in,
+     // we almost certainly guarantee no one outside will like the packet we are sending.
+-    bool busyTx = sendingPacket != NULL;
++    bool busyTx = sendingPacket != NULL || rawTxActive.load(std::memory_order_acquire);
+     bool busyRx = isReceiving && isActivelyReceiving();
+ 
+     if (busyTx || busyRx) {
+@@ -221,7 +221,7 @@ meshtastic_QueueStatus RadioLibInterface::getQueueStatus()
+ 
+ bool RadioLibInterface::canSleep()
+ {
+-    bool res = txQueue.empty();
++    bool res = txQueue.empty() && !rawTxActive.load(std::memory_order_acquire);
+     if (!res) { // only print debug messages if we are vetoing sleep
+         LOG_DEBUG("Radio wait to sleep, txEmpty=%d", res);
+     }
+@@ -233,7 +233,7 @@ Initially implemented to protect T-Echo's capacitive touch button from spurious
+ */
+ bool RadioLibInterface::isSending()
+ {
+-    return sendingPacket != NULL;
++    return sendingPacket != NULL || rawTxActive.load(std::memory_order_acquire);
+ }
+ 
+ /** Attempt to cancel a previously sent packet.  Returns true if a packet was found we could cancel */
+@@ -362,6 +362,7 @@ currently active.
+ */
+ void RadioLibInterface::onNotify(uint32_t notification)
+ {
++    std::lock_guard<std::mutex> rawLock(rawRadioMutex);
+ 
+     switch (notification) {
+     case ISR_TX:
+@@ -375,6 +376,12 @@ void RadioLibInterface::onNotify(uint32_t notification)
+         setTransmitDelay();
+         break;
+     case TRANSMIT_DELAY_COMPLETED:
++        if (rawTxActive.load(std::memory_order_acquire)) {
++            // MeshCore owns the radio; try again after the next contention window.
++            setTransmitDelay();
++            break;
++        }
++
+ 
+         // If we are not currently in receive mode, then restart the random delay (this can happen if the main thread
+         // has placed the unit into standby)  FIXME, how will this work if the chipset is in sleep mode?
+@@ -496,6 +503,13 @@ bool RadioLibInterface::removePendingTXPacket(NodeNum from, PacketId id, uint32_
+ 
+ void RadioLibInterface::handleTransmitInterrupt()
+ {
++    if (rawTxActive.load(std::memory_order_acquire)) {
++        rawTxActive.store(false, std::memory_order_release);
++        rawTxDone.store(true, std::memory_order_release);
++        powerMon->clearState(meshtastic_PowerMon_State_Lora_TXOn);
++        return;
++    }
++
+     // This can be null if we forced the device to enter standby mode.  In that case
+     // ignore the transmit interrupt
+     if (sendingPacket)
+@@ -569,6 +583,18 @@ void RadioLibInterface::handleReceiveInterrupt()
+         airTime->logAirtime(RX_ALL_LOG, rxMsec);
+ 
+     } else {
++        // Give the dual-protocol stack a chance to consume its own frames before
++        // Meshtastic tries to parse them.
++        if (rawPacketHandler != nullptr) {
++            lastRawSnr = iface->getSNR();
++            lastRawRssi = iface->getRSSI();
++            if (rawPacketHandler->handleRawPacket(reinterpret_cast<const uint8_t *>(&radioBuffer), length, lastRawSnr,
++                                                  lastRawRssi)) {
++                airTime->logAirtime(RX_ALL_LOG, rxMsec);
++                return;
++            }
++        }
++
+         // Skip the 4 headers that are at the beginning of the rxBuf
+         int32_t payloadLen = length - sizeof(PacketHeader);
+ 
+@@ -664,6 +690,35 @@ void RadioLibInterface::setStandby()
+     powerMon->clearState(meshtastic_PowerMon_State_Lora_TXOn);
+ }
+ 
++/** start an immediate raw-frame transmit for the dual-protocol MeshCore stack */
++bool RadioLibInterface::rawTransmit(const uint8_t *data, size_t len)
++{
++    std::lock_guard<std::mutex> rawLock(rawRadioMutex);
++
++    if (data == nullptr || len == 0 || len > MAX_LORA_PAYLOAD_LEN || sendingPacket != nullptr ||
++        rawTxActive.load(std::memory_order_acquire)) {
++        return false;
++    }
++
++    configHardwareForSend();
++
++    rawTxActive.store(true, std::memory_order_release);
++    rawTxDone.store(false, std::memory_order_release);
++
++    int res = iface->startTransmit(const_cast<uint8_t *>(data), len);
++    if (res != RADIOLIB_ERR_NONE) {
++        LOG_ERROR("raw startTransmit failed, error=%d", res);
++        rawTxActive.store(false, std::memory_order_release);
++        powerMon->clearState(meshtastic_PowerMon_State_Lora_TXOn);
++        startReceive();
++        return false;
++    }
++
++    enableInterrupt(isrTxLevel0);
++    lastTxStart = millis();
++    return true;
++}
++
+ /** start an immediate transmit */
+ bool RadioLibInterface::startSend(meshtastic_MeshPacket *txp)
+ {
+diff --git a/src/mesh/RadioLibInterface.h b/src/mesh/RadioLibInterface.h
+index cfbfbe1b5856172019735e378ed3d2fd95644c9e..1514413697628b9813ea264171a73cabda0d1cd0 100644
+--- a/src/mesh/RadioLibInterface.h
++++ b/src/mesh/RadioLibInterface.h
+@@ -7,6 +7,9 @@
+ #include <RadioLib.h>
+ #include <sys/types.h>
+ 
++#include <atomic>
++#include <mutex>
++
+ // ESP32 has special rules about ISR code
+ #ifdef ARDUINO_ARCH_ESP32
+ #define INTERRUPT_ATTR IRAM_ATTR
+@@ -128,7 +131,7 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
+      * Get the current calculated noise floor in dBm
+      * Returns -120 dBm if not yet calibrated
+      */
+-    int32_t getNoiseFloor();
++    int32_t getNoiseFloor() override;
+ 
+     /**
+      * Calculate the average noise floor from collected samples
+@@ -197,6 +200,15 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
+      */
+     virtual bool isSending();
+ 
++    /// Raw-frame access used by the dual-protocol MeshCore stack.
++    void setRawPacketHandler(RawPacketHandler *handler) override { rawPacketHandler = handler; }
++    bool rawTransmit(const uint8_t *data, size_t len) override;
++    bool rawTransmitDone() const override { return rawTxDone.load(std::memory_order_acquire); }
++    void rawTransmitFinished() override { rawTxDone.store(false, std::memory_order_release); }
++    bool rawTransmitActive() const override { return rawTxActive.load(std::memory_order_acquire); }
++    float getLastRssi() const override { return lastRawRssi; }
++    float getLastSnr() const override { return lastRawSnr; }
++
+     /** Attempt to cancel a previously sent packet.  Returns true if a packet was found we could cancel */
+     virtual bool cancelSending(NodeNum from, PacketId id) override;
+ 
+@@ -232,6 +244,13 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
+     bool randomBytes(uint8_t *buffer, size_t length);
+ 
+   private:
++    RawPacketHandler *rawPacketHandler = nullptr;
++    std::atomic<bool> rawTxActive{false};
++    std::atomic<bool> rawTxDone{false};
++    volatile float lastRawSnr = 0;
++    volatile float lastRawRssi = 0;
++    std::mutex rawRadioMutex;
++
+     uint8_t getNoiseFloorSampleCountInternal() const;
+     int32_t getAverageNoiseFloorInternal() const;
+ 

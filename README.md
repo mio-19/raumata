@@ -7,6 +7,35 @@ Commits in this repository are bookkeeping: they may be squashed, reordered or
 rewritten whenever the series is regenerated. The tooling is adapted from
 [cheetah-1.16's patch-series scripts](https://github.com/gommehdnet/cheetah-1.16/tree/master/scripts).
 
+## Current series: Meshtastic + MeshCore
+
+The first series turns the Heltec V3 firmware into a shared-PHY dual-protocol
+node:
+
+- Meshtastic and [MeshCore](https://github.com/ripplebiz/MeshCore) both run on
+  the same SX1262 and the same LoRa PHY.
+- MeshCore frames carry the four-byte `RAUM` transport tag so they can be
+  demultiplexed from Meshtastic frames on receive.
+- MeshCore's identity and channels persist in NVS; the node advertises and
+  supports direct/group text.
+- A USB-serial mux serves both Meshtastic's PhoneAPI and the MeshCore companion
+  protocol, so MeshCore apps can connect to the same port.
+
+Because one radio has one demodulator, the MeshCore side uses Meshtastic's
+frequency/BW/SF/CR/sync-word settings. It reaches MeshCore peers configured to
+the same PHY, **not** the standard MeshCore 916.575 MHz/SF7 preset. Both stacks
+also share one airtime budget. The patched tree contains
+`docs/raumata-dual-protocol.md` with the design and limitations.
+
+Build the dual-protocol image from the working tree:
+
+```sh
+cd work/firmware
+pio run -e heltec-v3-dual
+```
+
+`heltec-v3-dual` is the only build target verified by this series.
+
 ## Layout
 
 | Path              | Purpose                                                        |

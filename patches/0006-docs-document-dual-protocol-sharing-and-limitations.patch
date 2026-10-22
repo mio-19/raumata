@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mio <mio@mio19.uk>
+Date: Thu, 22 Oct 2026 23:00:40 +1100
+Subject: [PATCH] docs: document dual-protocol sharing and limitations
+
+
+diff --git a/docs/raumata-dual-protocol.md b/docs/raumata-dual-protocol.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..8d54c91e26de6048b24f671b525bc4edfd0e027c
+--- /dev/null
++++ b/docs/raumata-dual-protocol.md
+@@ -0,0 +1,79 @@
++# Raumata dual-protocol stack
++
++This tree can run Meshtastic and MeshCore at the same time on the Heltec V3's
++single SX1262.  The goal is to let one radio participate in a Meshtastic mesh
++and a MeshCore mesh without a hardware modification.
++
++## Shared PHY
++
++A LoRa receiver has one demodulator configuration at a time.  Meshtastic's
++default ANZ LongFast profile (BW250/SF11/CR5, sync word `0x2B`) and MeshCore's
++Australia preset (916.575 MHz, BW62.5/SF7) cannot be received simultaneously.
++
++Raumata therefore puts both stacks on the **same PHY**: the frequency,
++bandwidth, spreading factor, coding rate, sync word, preamble length, and CRC
++settings configured for Meshtastic.  MeshCore's radio parameters are mirrored
++from Meshtastic and `CMD_SET_RADIO_PARAMS` is rejected by the companion
++interface.
++
++This means the MeshCore side is a *shared-PHY sub-mesh*: MeshCore peers must be
++configured to the same PHY.  It does not talk to standard MeshCore nodes using
++the public 916.575 MHz/SF7 preset unless those nodes are reconfigured too.
++
++## Frame demultiplexing
++
++MeshCore frames are prepended with the four-byte transport tag `RAUM` before
++they reach the radio.  Received frames beginning with the tag are stripped and
++handed to MeshCore; everything else is passed to Meshtastic unchanged.  The tag
++is transport-level only, so MeshCore's packet format and cryptography are
++unmodified.
++
++## Radio ownership
++
++`RadioLibInterface` gains a raw-frame sink and a raw transmit path:
++
++- RX: the sink runs after `readData()` and before Meshtastic header parsing.
++  MeshCore frames are queued for `MeshCoreRadio::recvRaw()`.
++- TX: MeshCore and Meshtastic serialize access with a mutex and an owner flag.
++  If Meshtastic is transmitting, MeshCore keeps its frame pending and retries
++  from `MeshCoreRadio::loop()`.  Meshtastic's TX queue waits while MeshCore owns
++  the radio.
++
++Both stacks share one antenna and one airtime budget, so collisions and
++occasional dropped frames are expected under heavy load.
++
++## MeshCore node
++
++`src/raumata/MeshCoreNode.*` is a `BaseChatMesh` subclass with:
++
++- an ed25519 identity persisted in NVS (`raumata/mc_id`);
++- up to eight channels persisted in NVS (`raumata/mc_ch`), defaulting to the
++  MeshCore public channel;
++- adverts on boot and every 15 minutes;
++- direct and group text messages;
++- a queue of received messages for the companion protocol.
++
++Contacts learned from adverts are kept in RAM and are not persisted yet.
++
++## Companion interface
++
++A USB-serial mux parses both Meshtastic (`0x94 0xC3`) and MeshCore (`<`) frame
++framing.  MeshCore companion apps can use the USB port; Meshtastic's PhoneAPI
++continues to work on the same port.  While MeshCore companion mode is active,
++Meshtastic debug text and FromRadio writes are suppressed so the app sees a
++clean frame stream.
++
++The companion implementation covers app start, device query, time sync,
++contacts, channels, sending/receiving text, self-adverts, and battery/storage.
++Unsupported or radio-changing commands return `ERR_CODE_UNSUPPORTED_CMD`.
++MeshCore BLE companion is not implemented in this series.
++
++## Build
++
++```sh
++pio run -e heltec-v3-dual
++```
++
++The environment vendors MeshCore's core under `lib/meshcore` and adds the
++`rweather/Crypto` and `densaugeo/base64` libraries for MeshCore's AES/SHA-256
++and channel-key handling.  Only the Heltec V3 profile is verified.
