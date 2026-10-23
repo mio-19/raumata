@@ -1,20 +1,18 @@
 # Dual identity, presence, and simultaneous companion access
 
-Status: implemented in `0004-raumata-add-usb-companion-serial-mux.patch` and `0007-raumata-add-dual-identity-link-and-presence-schedule.patch`.
+Status: identity link, staggered presence, and the USB companion mux are
+implemented. Operating modes decide which stack advertises and how airtime is
+split; see [shared-phy-profiles.md](./shared-phy-profiles.md).
 
-The current six-patch series already runs Meshtastic and MeshCore on one
-SX1262 with a shared PHY, gives the MeshCore side its own ed25519 identity,
-adverts, channels and text messaging, and multiplexes Meshtastic and MeshCore
-framing on USB serial. It does **not** yet link the two identities explicitly,
-schedule their presence, or support two companion apps at the same time. This
-document specifies how to add those pieces.
+The series runs Meshtastic and MeshCore on one SX1262, gives the MeshCore side
+its own ed25519 identity, links that identity to the Meshtastic node, staggers
+presence, and multiplexes Meshtastic and MeshCore framing on USB serial.
+MeshCore BLE and TCP companions, and the cross-protocol bridge, are still out
+of this series.
 
-> The PHY is a first-class, selectable profile rather than “MeshCore mirrors
-> Meshtastic.” See
-> [shared-phy-profiles.md](./shared-phy-profiles.md). The current series still
-> mirrors Meshtastic's PHY; the next PHY series replaces that with a profile
-> that can be a Meshtastic preset, a MeshCore preset, a dual preset, or custom
-> values.
+> The radio uses one native physical configuration, chosen by the operating
+> mode: a Meshtastic preset or a MeshCore preset. See
+> [shared-phy-profiles.md](./shared-phy-profiles.md).
 
 ## 1. Goals
 
@@ -213,8 +211,9 @@ Add a `PresenceScheduler`:
 Add a shared airtime budget:
 
 - Track transmitted milliseconds per rolling hour across both stacks.
-- Reserve a configurable share for each protocol. A simple default is 75%
-  Meshtastic / 25% MeshCore.
+- Reserve a share for each protocol from the operating mode: 90/10 when one
+  protocol is primary, 50/50 when both are active. The secondary protocol's
+  periodic presence is off in a "mainly" mode.
 - Classify traffic: control/ACK > text > position > telemetry > adverts.
   Defer or drop adverts/telemetry first when the budget is exhausted.
 - MeshCore's `Dispatcher` already has a tx budget; set its

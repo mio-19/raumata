@@ -1,0 +1,386 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mio <mio@mio19.uk>
+Date: Sat, 24 Oct 2026 08:07:14 +1100
+Subject: [PATCH] meshcore: select the Raumata operating mode and radio profile
+
+The MeshCore tab can switch between mainly Meshtastic, mainly MeshCore, and both protocols on either family's physical configuration.
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+
+diff --git a/feature/meshcore/README.md b/feature/meshcore/README.md
+index 9b04eaed7f510faffac6209bd29a09afa57e2966..9711a18b66cdb49bd74db4304dbd8b12fba59402 100644
+--- a/feature/meshcore/README.md
++++ b/feature/meshcore/README.md
+@@ -40,8 +40,10 @@ uses the app's existing Bluetooth permissions.
+ ## Usage
+ 
+ Select the **MeshCore** destination in the app shell, choose USB or Bluetooth,
+-scan, and connect. The screen shows channels and contacts; tapping one opens a
+-chat pane with a message composer.
++scan, and connect. The screen shows the operating mode (mainly Meshtastic,
++mainly MeshCore, or both protocols on a Meshtastic or MeshCore physical
++profile), the presets that mode allows, then channels and contacts. Tapping a
++channel or contact opens a chat pane with a message composer.
+ 
+ ## Limitations
+ 
+diff --git a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreRepository.kt b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreRepository.kt
+index 1bedcbd6a911309b50d8724ef8ef61e3ed4dc147..dcacc3922e916f165714335f3ed62b8d06a047bf 100644
+--- a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreRepository.kt
++++ b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreRepository.kt
+@@ -40,11 +40,16 @@ import kotlinx.coroutines.flow.flowOf
+ import kotlinx.coroutines.flow.stateIn
+ import kotlinx.coroutines.flow.update
+ import kotlinx.coroutines.launch
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
+ import org.koin.core.annotation.Single
+ import org.meshtastic.core.di.CoroutineDispatchers
+ import org.meshtastic.feature.meshcore.model.MeshCoreChatMessage
+ import org.meshtastic.feature.meshcore.model.MeshCoreDevice
+ import org.meshtastic.feature.meshcore.model.MeshCoreTransport
++import org.meshtastic.feature.meshcore.model.OperatingMode
++import org.meshtastic.feature.meshcore.model.RaumataRadioState
++import org.meshtastic.feature.meshcore.model.radioStateFromCustomVars
+ import org.meshtastic.feature.meshcore.model.publicKeyPrefixHex
+ import org.meshtastic.feature.meshcore.model.toPrefixHex
+ 
+@@ -114,6 +119,10 @@ class MeshCoreRepository(
+     private val _messages = MutableStateFlow<List<MeshCoreChatMessage>>(emptyList())
+     val messages: StateFlow<List<MeshCoreChatMessage>> = _messages.asStateFlow()
+ 
++    private val radioMutex = Mutex()
++    private val _radio = MutableStateFlow<RaumataRadioState?>(null)
++    val radio: StateFlow<RaumataRadioState?> = _radio.asStateFlow()
++
+     init {
+         scope.launch {
+             connection
+@@ -179,6 +188,8 @@ class MeshCoreRepository(
+             .onSuccess {
+                 connection.value = it
+                 _messages.value = emptyList()
++                _radio.value = null
++                refreshRadio()
+             }
+             .onFailure { _error.value = it.message ?: "Could not connect to MeshCore device" }
+     }
+@@ -186,6 +197,7 @@ class MeshCoreRepository(
+     suspend fun disconnect() {
+         connection.value?.disconnect()
+         connection.value = null
++        _radio.value = null
+     }
+ 
+     suspend fun sendChannelMessage(channelIndex: Int, text: String) {
+@@ -233,10 +245,38 @@ class MeshCoreRepository(
+         runCatching {
+                 conn.refreshChannels()
+                 conn.refreshContacts()
++                refreshRadio()
+             }
+             .onFailure { _error.value = it.message ?: "Could not refresh MeshCore state" }
+     }
+ 
++    suspend fun refreshRadio() {
++        val conn = connection.value ?: return
++        radioMutex.withLock {
++            runCatching { radioStateFromCustomVars(conn.getCustomVars()) }
++                .onSuccess { _radio.value = it }
++                .onFailure { _error.value = it.message ?: "Could not read the radio mode" }
++        }
++    }
++
++    suspend fun setOperatingMode(mode: OperatingMode) {
++        val conn = connection.value ?: return
++        radioMutex.withLock {
++            runCatching { conn.setCustomVar("mode", mode.wire) }
++                .onSuccess { _radio.value = radioStateFromCustomVars(conn.getCustomVars()) }
++                .onFailure { _error.value = it.message ?: "Could not set the operating mode" }
++        }
++    }
++
++    suspend fun setPhyProfile(id: Int) {
++        val conn = connection.value ?: return
++        radioMutex.withLock {
++            runCatching { conn.setCustomVar("phy.id", id.toString()) }
++                .onSuccess { _radio.value = radioStateFromCustomVars(conn.getCustomVars()) }
++                .onFailure { _error.value = it.message ?: "Could not set the radio profile" }
++        }
++    }
++
+     fun clearError() {
+         _error.value = null
+     }
+diff --git a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreViewModel.kt b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreViewModel.kt
+index 6ce2ab192b36e6f10567d89ec0216f8e549d6f18..f61f4f07ca597874aa6e56b72a4407c59601f652 100644
+--- a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreViewModel.kt
++++ b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreViewModel.kt
+@@ -26,6 +26,7 @@ import kotlinx.coroutines.launch
+ import org.koin.core.annotation.KoinViewModel
+ import org.meshtastic.feature.meshcore.model.MeshCoreDevice
+ import org.meshtastic.feature.meshcore.model.MeshCoreTransport
++import org.meshtastic.feature.meshcore.model.OperatingMode
+ 
+ @KoinViewModel
+ class MeshCoreViewModel(private val repository: MeshCoreRepository) : ViewModel() {
+@@ -35,6 +36,7 @@ class MeshCoreViewModel(private val repository: MeshCoreRepository) : ViewModel(
+     val contacts = repository.contacts
+     val selfInfo = repository.selfInfo
+     val messages = repository.messages
++    val radio = repository.radio
+     val error = repository.error
+ 
+     private val _transport = MutableStateFlow(MeshCoreTransport.USB)
+@@ -97,5 +99,13 @@ class MeshCoreViewModel(private val repository: MeshCoreRepository) : ViewModel(
+         viewModelScope.launch { repository.refresh() }
+     }
+ 
++    fun setOperatingMode(mode: OperatingMode) {
++        viewModelScope.launch { repository.setOperatingMode(mode) }
++    }
++
++    fun setPhyProfile(id: Int) {
++        viewModelScope.launch { repository.setPhyProfile(id) }
++    }
++
+     fun clearError() = repository.clearError()
+ }
+diff --git a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/model/RadioMode.kt b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/model/RadioMode.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..e874d3815f2fbab5564b7f03bdc36d3d76bdf0a9
+--- /dev/null
++++ b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/model/RadioMode.kt
+@@ -0,0 +1,112 @@
++/*
++ * Copyright (c) 2026 Meshtastic LLC
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++package org.meshtastic.feature.meshcore.model
++
++/** Which preset family supplies the single physical radio configuration. */
++enum class PhyFamily {
++    MESHTASTIC,
++    MESHCORE,
++}
++
++/**
++ * How one radio is shared. The wire values match the firmware `mode` custom var.
++ */
++enum class OperatingMode(
++    val wire: String,
++    val label: String,
++    val summary: String,
++    val family: PhyFamily,
++) {
++    MAINLY_MESHTASTIC(
++        wire = "mainly-meshtastic",
++        label = "Mainly Meshtastic",
++        summary = "Meshtastic profile and presence. MeshCore stays connected and does not advertise.",
++        family = PhyFamily.MESHTASTIC,
++    ),
++    MAINLY_MESHCORE(
++        wire = "mainly-meshcore",
++        label = "Mainly MeshCore",
++        summary = "MeshCore profile and presence. Meshtastic background traffic stays off.",
++        family = PhyFamily.MESHCORE,
++    ),
++    SHARED_MESHTASTIC(
++        wire = "shared-meshtastic",
++        label = "Both · Meshtastic PHY",
++        summary = "Both protocols on a Meshtastic physical configuration (sync 0x2B).",
++        family = PhyFamily.MESHTASTIC,
++    ),
++    SHARED_MESHCORE(
++        wire = "shared-meshcore",
++        label = "Both · MeshCore PHY",
++        summary = "Both protocols on a MeshCore physical configuration (sync 0x12).",
++        family = PhyFamily.MESHCORE,
++    ),
++    ;
++
++    companion object {
++        fun fromWire(value: String?): OperatingMode? = entries.firstOrNull { it.wire == value }
++    }
++}
++
++/** A native preset the firmware will accept for one family. Ids match the firmware table. */
++data class PhyPreset(
++    val id: Int,
++    val name: String,
++    val family: PhyFamily,
++    val detail: String,
++)
++
++val phyPresets: List<PhyPreset> =
++    listOf(
++        PhyPreset(1, "ANZ LongFast", PhyFamily.MESHTASTIC, "250 kHz · SF11 · 0x2B"),
++        PhyPreset(2, "ANZ MediumSlow", PhyFamily.MESHTASTIC, "250 kHz · SF10 · 0x2B"),
++        PhyPreset(3, "ANZ ShortFast", PhyFamily.MESHTASTIC, "250 kHz · SF7 · 0x2B"),
++        PhyPreset(4, "US LongFast", PhyFamily.MESHTASTIC, "250 kHz · SF11 · 0x2B"),
++        PhyPreset(5, "EU868 LongFast", PhyFamily.MESHTASTIC, "250 kHz · SF11 · 0x2B"),
++        PhyPreset(10, "Australia (Narrow)", PhyFamily.MESHCORE, "916.575 MHz · SF7 · 0x12"),
++        PhyPreset(11, "New Zealand (Narrow)", PhyFamily.MESHCORE, "917.375 MHz · SF7 · 0x12"),
++        PhyPreset(12, "US/Canada (Narrow)", PhyFamily.MESHCORE, "910.525 MHz · SF7 · 0x12"),
++        PhyPreset(13, "Portugal 868", PhyFamily.MESHCORE, "869.618 MHz · SF7 · 0x12"),
++    )
++
++/** Operating mode and preset reported by a Raumata node. */
++data class RaumataRadioState(
++    val mode: OperatingMode?,
++    val profileId: Int?,
++    val profileName: String,
++    val syncHex: String,
++)
++
++fun parseCustomVars(text: String): Map<String, String> {
++    val out = linkedMapOf<String, String>()
++    for (part in text.split(',')) {
++        val idx = part.indexOf(':')
++        if (idx <= 0) continue
++        out[part.substring(0, idx)] = part.substring(idx + 1)
++    }
++    return out
++}
++
++fun radioStateFromCustomVars(text: String): RaumataRadioState {
++    val vars = parseCustomVars(text)
++    return RaumataRadioState(
++        mode = OperatingMode.fromWire(vars["mode"]),
++        profileId = vars["phy.id"]?.toIntOrNull(),
++        profileName = vars["phy.name"].orEmpty(),
++        syncHex = vars["phy.sync"].orEmpty(),
++    )
++}
+diff --git a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/ui/MeshCoreScreen.kt b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/ui/MeshCoreScreen.kt
+index 6cae267f30a7340e47be7dd063bb2fd5b7f93ab9..52cc29d039776ea5a27bf6ffc123223c99e712b9 100644
+--- a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/ui/MeshCoreScreen.kt
++++ b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/ui/MeshCoreScreen.kt
+@@ -16,6 +16,7 @@
+  */
+ package org.meshtastic.feature.meshcore.ui
+ 
++import androidx.compose.foundation.horizontalScroll
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.PaddingValues
+@@ -25,6 +26,7 @@ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.height
+ import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.rememberScrollState
+ import androidx.compose.foundation.lazy.LazyColumn
+ import androidx.compose.foundation.lazy.items
+ import androidx.compose.material3.Button
+@@ -58,6 +60,9 @@ import org.meshtastic.feature.meshcore.MeshCoreViewModel
+ import org.meshtastic.feature.meshcore.model.MeshCoreChatMessage
+ import org.meshtastic.feature.meshcore.model.MeshCoreDevice
+ import org.meshtastic.feature.meshcore.model.MeshCoreTransport
++import org.meshtastic.feature.meshcore.model.OperatingMode
++import org.meshtastic.feature.meshcore.model.RaumataRadioState
++import org.meshtastic.feature.meshcore.model.phyPresets
+ import org.meshtastic.feature.meshcore.model.publicKeyPrefixHex
+ import org.meshtastic.feature.meshcore.model.toPrefixHex
+ 
+@@ -78,6 +83,7 @@ fun MeshCoreScreen(viewModel: MeshCoreViewModel = koinViewModel()) {
+     val transport by viewModel.transport.collectAsState()
+     val selectedChannel by viewModel.selectedChannel.collectAsState()
+     val selectedContact by viewModel.selectedContact.collectAsState()
++    val radio by viewModel.radio.collectAsState()
+     val error by viewModel.error.collectAsState()
+ 
+     val connected = connectionState is ConnectionState.Connected
+@@ -121,8 +127,11 @@ fun MeshCoreScreen(viewModel: MeshCoreViewModel = koinViewModel()) {
+                     ConnectedBrowser(
+                         channels = channels,
+                         contacts = contacts,
++                        radio = radio,
+                         onChannel = viewModel::selectChannel,
+                         onContact = viewModel::selectContact,
++                        onMode = viewModel::setOperatingMode,
++                        onProfile = viewModel::setPhyProfile,
+                     )
+                 } else {
+                     val title =
+@@ -231,12 +240,16 @@ private fun DevicePicker(
+ private fun ConnectedBrowser(
+     channels: List<Channel>,
+     contacts: List<Contact>,
++    radio: RaumataRadioState?,
+     onChannel: (Int) -> Unit,
+     onContact: (Contact) -> Unit,
++    onMode: (OperatingMode) -> Unit,
++    onProfile: (Int) -> Unit,
+ ) {
+     var tab by remember { mutableIntStateOf(0) }
+ 
+     Column(modifier = Modifier.fillMaxSize()) {
++        RadioModeCard(radio = radio, onMode = onMode, onProfile = onProfile)
+         TabRow(selectedTabIndex = tab) {
+             Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Channels") })
+             Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Contacts") })
+@@ -270,6 +283,52 @@ private fun ConnectedBrowser(
+     }
+ }
+ 
++@Composable
++private fun RadioModeCard(
++    radio: RaumataRadioState?,
++    onMode: (OperatingMode) -> Unit,
++    onProfile: (Int) -> Unit,
++) {
++    val mode = radio?.mode
++    Card(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
++        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
++            Text("Radio mode", style = MaterialTheme.typography.titleMedium)
++            if (mode == null) {
++                Text("This node did not report a Raumata operating mode.")
++                return@Column
++            }
++            Text(mode.summary, style = MaterialTheme.typography.bodySmall)
++            Row(
++                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
++                horizontalArrangement = Arrangement.spacedBy(8.dp),
++            ) {
++                OperatingMode.entries.forEach { choice ->
++                    FilterChip(
++                        selected = choice == mode,
++                        onClick = { onMode(choice) },
++                        label = { Text(choice.label) },
++                    )
++                }
++            }
++            val activeName = radio.profileName.ifBlank { "Profile ${radio.profileId ?: "?"}" }
++            val sync = if (radio.syncHex.isBlank()) "" else " · sync 0x${radio.syncHex}"
++            Text("$activeName$sync", style = MaterialTheme.typography.bodyMedium)
++            Row(
++                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
++                horizontalArrangement = Arrangement.spacedBy(8.dp),
++            ) {
++                phyPresets.filter { it.family == mode.family }.forEach { preset ->
++                    FilterChip(
++                        selected = preset.id == radio.profileId,
++                        onClick = { onProfile(preset.id) },
++                        label = { Text(preset.name) },
++                    )
++                }
++            }
++        }
++    }
++}
++
+ @Composable
+ private fun ChatPane(
+     title: String,

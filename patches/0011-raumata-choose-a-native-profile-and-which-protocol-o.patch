@@ -1,0 +1,951 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mio <mio@mio19.uk>
+Date: Sat, 24 Oct 2026 08:07:10 +1100
+Subject: [PATCH] raumata: choose a native profile and which protocol owns the
+ air
+
+One radio stays on a Meshtastic or MeshCore preset. The operating mode selects that profile, which stack advertises, and how the shared airtime budget is split.
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+
+diff --git a/docs/raumata-dual-protocol.md b/docs/raumata-dual-protocol.md
+index 1ad6969dadb61285d4c0a4cbc7ba97ae88a155e0..667f2f1991b3b345ea950c951e8634b396b9d478 100644
+--- a/docs/raumata-dual-protocol.md
++++ b/docs/raumata-dual-protocol.md
+@@ -7,27 +7,45 @@ mesh without a hardware modification.
+ ## Shared PHY profiles
+ 
+ A LoRa receiver has one demodulator configuration at a time. Raumata keeps the
+-SX1262 in **one selectable physical configuration (`PhyProfile`)** stored in NVS
+-(`raumata/phy`) and shared by both stacks:
+-
+-- **Meshtastic presets** (`ANZ LongFast`, `ANZ MediumSlow`, `ANZ ShortFast`,
+-  `US LongFast`, `EU868 LongFast`): native sync word `0x2B`, 16-symbol preamble,
+-  region/channel frequency calculation.
+-- **MeshCore presets** (`Australia (Narrow)` 916.575 MHz BW62.5/SF7/CR7,
++SX1262 in **one physical configuration** taken from a native preset. An
++operating mode (`raumata/mode`) chooses which family supplies that
++configuration and how the two stacks share the radio:
++
++| Mode | Physical configuration | Who transmits |
++| --- | --- | --- |
++| `mainly-meshtastic` | Meshtastic preset (sync `0x2B`, 16-symbol preamble) | Meshtastic presence and about 90% of the airtime budget. MeshCore stays available to the companion and does not advertise. |
++| `mainly-meshcore` | MeshCore preset (sync `0x12`, 32-symbol preamble) | MeshCore presence and about 90% of the airtime budget. Meshtastic background traffic (nodeinfo, position, telemetry) stays off; messages the phone sends still go out. |
++| `shared-meshtastic` | Meshtastic preset | Both stacks advertise and send, each with about half of the airtime budget. |
++| `shared-meshcore` | MeshCore preset | Both stacks advertise and send, each with about half of the airtime budget. |
++
++There is no sync word that lets stock Meshtastic peers and stock MeshCore peers
++hear the same transmission. A Meshtastic profile reaches stock Meshtastic
++peers. A MeshCore profile reaches stock MeshCore peers. The other protocol is
++on that same configuration, so its peers must be Raumata nodes or configured to
++match.
++
++Presets:
++
++- **Meshtastic:** `ANZ LongFast`, `ANZ MediumSlow`, `ANZ ShortFast`,
++  `US LongFast`, `EU868 LongFast`.
++- **MeshCore:** `Australia (Narrow)` 916.575 MHz BW62.5/SF7/CR7,
+   `New Zealand (Narrow)` 917.375 MHz, `US/Canada (Narrow)` 910.525 MHz,
+-  `Portugal 868` 869.618 MHz): native sync word `0x12`, 32-symbol preamble,
+-  explicit frequency override.
+-- **Dual presets** (`Dual AU (common 0x2B)` and `Dual AU (common 0x12)`):
+-  explicit 916.575 MHz BW62.5/SF7/CR7 with a chosen common sync word.
+-- **Custom (`255`)**: user-defined frequency, bandwidth, spreading factor,
+-  coding rate, sync word, preamble length, and TX power.
+-
+-`raumata::phyInit()` loads the active profile before `initLoRa()` and drives
++  `Portugal 868` 869.618 MHz.
++
++`raumata::phyInit()` loads the mode and profile before `initLoRa()` and drives
+ both `config.lora` and `RadioInterface`'s `syncWord` and `preambleLength`.
+-Runtime changes from either the Meshtastic radio configuration or the MeshCore
+-companion API (`CMD_SET_RADIO_PARAMS`, `CMD_SET_RADIO_TX_POWER`,
+-`CMD_SET_PHY_PROFILE`, or CLI `phy list|get|set`) reconfigure the radio once for
+-both stacks and schedule a rate-limited re-advertisement.
++A profile from the other family is rejected. `CMD_SET_RADIO_PARAMS` selects a
++MeshCore preset only when the mode is using a MeshCore profile and the
++frequency, bandwidth, spreading factor, and coding rate match that preset.
++The Meshtastic app can change the preset while the mode uses a Meshtastic
++profile; in a MeshCore-profile mode those edits are put back.
++
++Runtime changes use the companion custom vars `mode` and `phy.id`,
++`CMD_SET_PHY_PROFILE`, or CLI `mode get|list|set` and `phy list|get|set`.
++The radio reconfigures once and schedules a rate-limited re-advertisement for
++whichever stacks the new mode allows to announce themselves. A node with no
++saved mode keeps both stacks on, using a Meshtastic profile unless the saved
++profile was already a MeshCore one.
+ 
+ ## Frame demultiplexing
+ 
+diff --git a/src/mesh/RadioLibInterface.cpp b/src/mesh/RadioLibInterface.cpp
+index b53a7e1bc9c0e470b96e791cd069aabb06547912..f65720b4d1d4b5d1ed1f650338c207aeb9608c9d 100644
+--- a/src/mesh/RadioLibInterface.cpp
++++ b/src/mesh/RadioLibInterface.cpp
+@@ -1,5 +1,8 @@
+ #include "RadioLibInterface.h"
+ #include "MeshTypes.h"
++#ifdef RAUMATA_DUAL_PROTOCOL
++#include "raumata/OperatingMode.h"
++#endif
+ #include "NodeDB.h"
+ #include "PowerMon.h"
+ #include "SPILock.h"
+@@ -403,6 +406,16 @@ void RadioLibInterface::onNotify(uint32_t notification)
+                         // actual transmission as short as possible
+                         txp = txQueue.dequeue();
+                         assert(txp);
++#ifdef RAUMATA_DUAL_PROTOCOL
++                        while (txp && !raumata::meshtasticPacketMayTransmit(txp->priority)) {
++                            LOG_DEBUG("Drop Meshtastic background packet; operating mode keeps it off the air");
++                            packetPool.release(txp);
++                            txp = txQueue.empty() ? nullptr : txQueue.dequeue();
++                        }
++                        if (!txp) {
++                            break;
++                        }
++#endif
+                         startSend(txp);
+                         LOG_DEBUG("%d packets remain in the TX queue", txQueue.getMaxLen() - txQueue.getFree());
+                     }
+@@ -735,6 +748,12 @@ bool RadioLibInterface::startSend(meshtastic_MeshPacket *txp)
+         LOG_WARN("Drop Tx packet because LoRa Tx disabled");
+         packetPool.release(txp);
+         return false;
++#ifdef RAUMATA_DUAL_PROTOCOL
++    } else if (!raumata::meshtasticPacketMayTransmit(txp->priority)) {
++        LOG_DEBUG("Drop Tx packet because the operating mode reserves background airtime for MeshCore");
++        packetPool.release(txp);
++        return false;
++#endif
+     } else {
+         configHardwareForSend(); // must be after setStandby
+ 
+diff --git a/src/raumata/CompanionProtocol.h b/src/raumata/CompanionProtocol.h
+index 5c6f1b3f08180c9c6d0a12cab17b42af45a5e612..054870d0fc7619687ff78936f73dba9a6615feec 100644
+--- a/src/raumata/CompanionProtocol.h
++++ b/src/raumata/CompanionProtocol.h
+@@ -84,7 +84,7 @@ constexpr uint8_t RAUMATA_ADV_TYPE_CHAT = 1;
+ constexpr uint8_t RAUMATA_TXT_TYPE_PLAIN = 0;
+ 
+ constexpr uint8_t FIRMWARE_VER_CODE = 14;
+-constexpr const char *FIRMWARE_VERSION = "raumata-0.2";
++constexpr const char *FIRMWARE_VERSION = "raumata-0.3";
+ constexpr const char *FIRMWARE_BUILD_DATE = "23 Oct 2026";
+ #if defined(T_DECK)
+ constexpr const char *MANUFACTURER_NAME = "Raumata T-Deck";
+diff --git a/src/raumata/IdentityLink.cpp b/src/raumata/IdentityLink.cpp
+index b8f6df6b07a2a2b7417c0651bada517ab78ed947..83e87359ae6f1cb7e7eba8d721f0581288958045 100644
+--- a/src/raumata/IdentityLink.cpp
++++ b/src/raumata/IdentityLink.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include <Utils.h>
+ 
++#include "OperatingMode.h"
+ #include "PhyProfile.h"
+ #include "gps/RTC.h"
+ #include "mesh/MeshService.h"
+@@ -152,9 +153,10 @@ void formatCustomVars(char *dest, size_t destSize)
+     mesh::Utils::toHex(mcPrefixHex, gLinkRecord.mc_pubkey, 8);
+ 
+     const PhyProfile &phy = activePhyProfile();
+-    snprintf(dest, destSize, "msh.node:%08x,msh.pubkey:%s,mc.pubkey:%s,phy.id:%u,phy.name:%s,phy.sync:%02X",
+-             static_cast<unsigned int>(gLinkRecord.msh_node_num), mshFpHex, mcPrefixHex, phy.id, phy.name,
+-             activeSyncWord());
++    snprintf(dest, destSize,
++             "msh.node:%08x,msh.pubkey:%s,mc.pubkey:%s,mode:%s,phy.id:%u,phy.name:%s,phy.sync:%02X",
++             static_cast<unsigned int>(gLinkRecord.msh_node_num), mshFpHex, mcPrefixHex,
++             operatingModeName(activeOperatingMode()), phy.id, phy.name, activeSyncWord());
+ }
+ 
+ void formatLinkSummary(char *dest, size_t destSize)
+diff --git a/src/raumata/MeshCoreNode.cpp b/src/raumata/MeshCoreNode.cpp
+index de01d3c6b7d97ee0fd113e9758f9edfa94db2819..e552f82f26b0752876f4c86a24fa062ef6220af0 100644
+--- a/src/raumata/MeshCoreNode.cpp
++++ b/src/raumata/MeshCoreNode.cpp
+@@ -8,6 +8,7 @@
+ #include "CompanionProtocol.h"
+ #include "FSCommon.h"
+ #include "IdentityLink.h"
++#include "OperatingMode.h"
+ #include "PhyProfile.h"
+ #include "PowerStatus.h"
+ #include "PresenceScheduler.h"
+@@ -828,9 +829,16 @@ void MeshCoreNode::writePhyProfiles()
+ 
+     uint8_t frame[MAX_FRAME_SIZE];
+     int i = 0;
++    uint8_t listed = 0;
++    for (size_t idx = 0; idx < count; idx++) {
++        if (profileKindAllowed(static_cast<uint8_t>(table[idx].kind))) {
++            listed++;
++        }
++    }
++
+     frame[i++] = RESP_CODE_PHY_PROFILES;
+     frame[i++] = activePhyProfile().id;
+-    frame[i++] = static_cast<uint8_t>(count);
++    frame[i++] = listed;
+ 
+     for (size_t idx = 0; idx < count; idx++) {
+         // Compact per-preset entry: id(1) + kind(1) + sync(1) + sf(1) + cr(1) + preamble(2) + freq_khz(4) + bw_hz(4) = 15 bytes
+@@ -838,6 +846,9 @@ void MeshCoreNode::writePhyProfiles()
+             break;
+         }
+         const PhyProfile &p = table[idx];
++        if (!profileKindAllowed(static_cast<uint8_t>(p.kind))) {
++            continue;
++        }
+         frame[i++] = p.id;
+         frame[i++] = static_cast<uint8_t>(p.kind);
+         frame[i++] = p.sync_word;
+@@ -1216,7 +1227,14 @@ void MeshCoreNode::handleCommand(uint8_t command, const uint8_t *frame, size_t l
+             *colon = 0;
+             const char *key = kv;
+             const char *val = colon + 1;
+-            if (strcmp(key, "phy.id") == 0 || strcmp(key, "phy_profile") == 0) {
++            if (strcmp(key, "mode") == 0) {
++                OperatingMode mode;
++                if (parseOperatingModeName(val, mode) && applyOperatingMode(mode)) {
++                    writeOK();
++                } else {
++                    writeError(ERR_CODE_ILLEGAL_ARG);
++                }
++            } else if (strcmp(key, "phy.id") == 0 || strcmp(key, "phy_profile") == 0) {
+                 uint8_t id = static_cast<uint8_t>(strtoul(val, nullptr, 10));
+                 if (applyPhyProfile(id)) {
+                     writeOK();
+@@ -1337,7 +1355,8 @@ void MeshCoreNode::handleCommand(uint8_t command, const uint8_t *frame, size_t l
+             if (strcmp(cmd, "link") == 0) {
+                 formatLinkSummary(replyText, sizeof(replyFrame) - 1);
+                 writer_(replyFrame, 1 + strlen(replyText));
+-            } else if (handlePhyCliCommand(cmd, replyText, sizeof(replyFrame) - 1)) {
++            } else if (handleModeCliCommand(cmd, replyText, sizeof(replyFrame) - 1) ||
++                       handlePhyCliCommand(cmd, replyText, sizeof(replyFrame) - 1)) {
+                 writer_(replyFrame, 1 + strlen(replyText));
+             } else {
+                 writeError(ERR_CODE_UNSUPPORTED_CMD);
+diff --git a/src/raumata/OperatingMode.cpp b/src/raumata/OperatingMode.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..c6aec9a73a9e2fc1563de6657b60c3b70d45cf51
+--- /dev/null
++++ b/src/raumata/OperatingMode.cpp
+@@ -0,0 +1,312 @@
++#ifdef RAUMATA_DUAL_PROTOCOL
++#include "OperatingMode.h"
++
++#include <Arduino.h>
++#include <Preferences.h>
++#include <cstdio>
++#include <cstring>
++
++#include "PhyProfile.h"
++#include "mesh/NodeDB.h"
++#include "mesh/generated/meshtastic/mesh.pb.h"
++
++namespace raumata {
++namespace {
++
++struct SavedModeRecord {
++    uint8_t version;
++    uint8_t mode;
++    uint8_t last_meshtastic_id;
++    uint8_t last_meshcore_id;
++};
++
++constexpr uint8_t kSavedModeVersion = 1;
++constexpr float kMainlyPrimaryShare = 0.90f;
++constexpr float kMainlySecondaryShare = 0.10f;
++constexpr float kSharedShare = 0.50f;
++
++OperatingMode gMode = MODE_SHARED_MESHTASTIC_PHY;
++uint8_t gLastMeshtasticId = 0;
++uint8_t gLastMeshCoreId = 0;
++
++bool validMode(uint8_t mode)
++{
++    return mode <= MODE_SHARED_MESHCORE_PHY;
++}
++
++void saveModeToNvs()
++{
++    SavedModeRecord rec = {};
++    rec.version = kSavedModeVersion;
++    rec.mode = static_cast<uint8_t>(gMode);
++    rec.last_meshtastic_id = gLastMeshtasticId;
++    rec.last_meshcore_id = gLastMeshCoreId;
++
++    Preferences prefs;
++    if (prefs.begin("raumata", false)) {
++        prefs.putBytes("mode", &rec, sizeof(rec));
++        prefs.end();
++    }
++}
++
++bool loadModeFromNvs()
++{
++    Preferences prefs;
++    if (!prefs.begin("raumata", true)) {
++        return false;
++    }
++    size_t len = prefs.getBytesLength("mode");
++    if (len != sizeof(SavedModeRecord)) {
++        prefs.end();
++        return false;
++    }
++    SavedModeRecord rec = {};
++    bool ok = prefs.getBytes("mode", &rec, sizeof(rec)) == sizeof(rec);
++    prefs.end();
++    if (!ok || rec.version != kSavedModeVersion || !validMode(rec.mode)) {
++        return false;
++    }
++    gMode = static_cast<OperatingMode>(rec.mode);
++    gLastMeshtasticId = rec.last_meshtastic_id;
++    gLastMeshCoreId = rec.last_meshcore_id;
++    return true;
++}
++
++uint8_t regionDefaultProfile(bool meshcore)
++{
++    const auto region = config.lora.region;
++    if (!meshcore) {
++        if (region == meshtastic_Config_LoRaConfig_RegionCode_US) {
++            return 4;
++        }
++        if (region == meshtastic_Config_LoRaConfig_RegionCode_EU_868) {
++            return 5;
++        }
++        return 1;
++    }
++    if (region == meshtastic_Config_LoRaConfig_RegionCode_US) {
++        return 12;
++    }
++    if (region == meshtastic_Config_LoRaConfig_RegionCode_EU_868) {
++        return 13;
++    }
++    if (region == meshtastic_Config_LoRaConfig_RegionCode_NZ_865) {
++        return 11;
++    }
++    return 10;
++}
++
++} // namespace
++
++OperatingMode activeOperatingMode()
++{
++    return gMode;
++}
++
++const char *operatingModeName(OperatingMode mode)
++{
++    switch (mode) {
++    case MODE_MAINLY_MESHTASTIC:
++        return "mainly-meshtastic";
++    case MODE_MAINLY_MESHCORE:
++        return "mainly-meshcore";
++    case MODE_SHARED_MESHTASTIC_PHY:
++        return "shared-meshtastic";
++    case MODE_SHARED_MESHCORE_PHY:
++        return "shared-meshcore";
++    }
++    return "shared-meshtastic";
++}
++
++bool parseOperatingModeName(const char *name, OperatingMode &out)
++{
++    if (!name || !name[0]) {
++        return false;
++    }
++    if (strcmp(name, "mainly-meshtastic") == 0 || strcmp(name, "meshtastic") == 0) {
++        out = MODE_MAINLY_MESHTASTIC;
++        return true;
++    }
++    if (strcmp(name, "mainly-meshcore") == 0 || strcmp(name, "meshcore") == 0) {
++        out = MODE_MAINLY_MESHCORE;
++        return true;
++    }
++    if (strcmp(name, "shared-meshtastic") == 0 || strcmp(name, "both-meshtastic") == 0) {
++        out = MODE_SHARED_MESHTASTIC_PHY;
++        return true;
++    }
++    if (strcmp(name, "shared-meshcore") == 0 || strcmp(name, "both-meshcore") == 0) {
++        out = MODE_SHARED_MESHCORE_PHY;
++        return true;
++    }
++    return false;
++}
++
++bool operatingModeUsesMeshtasticPhy(OperatingMode mode)
++{
++    return mode == MODE_MAINLY_MESHTASTIC || mode == MODE_SHARED_MESHTASTIC_PHY;
++}
++
++bool operatingModeUsesMeshCorePhy(OperatingMode mode)
++{
++    return mode == MODE_MAINLY_MESHCORE || mode == MODE_SHARED_MESHCORE_PHY;
++}
++
++float meshCoreAirtimeShare()
++{
++    switch (gMode) {
++    case MODE_MAINLY_MESHTASTIC:
++        return kMainlySecondaryShare;
++    case MODE_MAINLY_MESHCORE:
++        return kMainlyPrimaryShare;
++    case MODE_SHARED_MESHTASTIC_PHY:
++    case MODE_SHARED_MESHCORE_PHY:
++        return kSharedShare;
++    }
++    return kSharedShare;
++}
++
++bool meshCorePresenceEnabled()
++{
++    return gMode != MODE_MAINLY_MESHTASTIC;
++}
++
++bool meshtasticPresenceEnabled()
++{
++    return gMode != MODE_MAINLY_MESHCORE;
++}
++
++bool meshtasticPacketMayTransmit(uint8_t priority)
++{
++    if (meshtasticPresenceEnabled()) {
++        return true;
++    }
++    return priority >= meshtastic_MeshPacket_Priority_DEFAULT;
++}
++
++bool profileKindAllowed(uint8_t kind)
++{
++    if (operatingModeUsesMeshtasticPhy(gMode)) {
++        return kind == PHY_MESHTASTIC_PRESET;
++    }
++    if (operatingModeUsesMeshCorePhy(gMode)) {
++        return kind == PHY_MESHCORE_PRESET;
++    }
++    return false;
++}
++
++void rememberProfileId(uint8_t id, uint8_t kind)
++{
++    if (id == 0 || id == kPhyProfileCustomId) {
++        return;
++    }
++    if (kind == PHY_MESHTASTIC_PRESET) {
++        gLastMeshtasticId = id;
++    } else if (kind == PHY_MESHCORE_PRESET) {
++        gLastMeshCoreId = id;
++    } else {
++        return;
++    }
++    saveModeToNvs();
++}
++
++uint8_t defaultProfileIdForMode(OperatingMode mode)
++{
++    const bool meshcore = operatingModeUsesMeshCorePhy(mode);
++    const uint8_t remembered = meshcore ? gLastMeshCoreId : gLastMeshtasticId;
++    const PhyProfile *preset = findPhyPreset(remembered);
++    const uint8_t want = meshcore ? static_cast<uint8_t>(PHY_MESHCORE_PRESET)
++                                  : static_cast<uint8_t>(PHY_MESHTASTIC_PRESET);
++    if (preset && static_cast<uint8_t>(preset->kind) == want) {
++        return preset->id;
++    }
++    return regionDefaultProfile(meshcore);
++}
++
++OperatingMode loadOrInferOperatingMode(uint8_t savedKind, uint8_t savedSync, bool haveSavedProfile)
++{
++    if (loadModeFromNvs()) {
++        return gMode;
++    }
++
++    gMode = MODE_SHARED_MESHTASTIC_PHY;
++    if (haveSavedProfile) {
++        const bool meshcoreFamily = savedKind == PHY_MESHCORE_PRESET ||
++                                    (savedKind == PHY_DUAL_PRESET && savedSync == kDefaultMeshCoreSyncWord) ||
++                                    (savedKind == PHY_CUSTOM && savedSync == kDefaultMeshCoreSyncWord);
++        if (meshcoreFamily) {
++            gMode = MODE_SHARED_MESHCORE_PHY;
++        }
++    }
++    saveModeToNvs();
++    return gMode;
++}
++
++bool applyOperatingMode(OperatingMode mode)
++{
++    if (!validMode(static_cast<uint8_t>(mode))) {
++        return false;
++    }
++
++    const bool changed = gMode != mode;
++    gMode = mode;
++    saveModeToNvs();
++
++    if (!profileKindAllowed(static_cast<uint8_t>(activePhyProfile().kind))) {
++        return applyPhyProfile(defaultProfileIdForMode(mode));
++    }
++    if (changed) {
++        notifyOperatingModeChanged();
++    }
++    return true;
++}
++
++bool handleModeCliCommand(const char *command, char *reply, size_t replySize)
++{
++    if (!command || !reply || replySize == 0) {
++        return false;
++    }
++    if (strncmp(command, "mode", 4) != 0 || (command[4] != '\0' && command[4] != ' ')) {
++        return false;
++    }
++
++    const char *args = command + 4;
++    while (*args == ' ') {
++        args++;
++    }
++
++    if (*args == '\0' || strcmp(args, "get") == 0) {
++        snprintf(reply, replySize, "mode %s phy=%u (%s) mc_share=%.0f%%", operatingModeName(gMode),
++                 activePhyProfile().id, activePhyProfile().name, meshCoreAirtimeShare() * 100.0f);
++        return true;
++    }
++
++    if (strcmp(args, "list") == 0) {
++        snprintf(reply, replySize,
++                 "mainly-meshtastic, mainly-meshcore, shared-meshtastic, shared-meshcore");
++        return true;
++    }
++
++    if (strncmp(args, "set ", 4) == 0) {
++        const char *name = args + 4;
++        while (*name == ' ') {
++            name++;
++        }
++        OperatingMode mode;
++        if (!parseOperatingModeName(name, mode) || !applyOperatingMode(mode)) {
++            snprintf(reply, replySize,
++                     "err: usage mode set <mainly-meshtastic|mainly-meshcore|shared-meshtastic|shared-meshcore>");
++            return true;
++        }
++        snprintf(reply, replySize, "ok: mode %s phy=%u (%s)", operatingModeName(gMode), activePhyProfile().id,
++                 activePhyProfile().name);
++        return true;
++    }
++
++    snprintf(reply, replySize, "err: usage mode [get|list|set <name>]");
++    return true;
++}
++
++} // namespace raumata
++
++#endif // RAUMATA_DUAL_PROTOCOL
+diff --git a/src/raumata/OperatingMode.h b/src/raumata/OperatingMode.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..84a7048e976175f8ace3125d0095e2b2e466b812
+--- /dev/null
++++ b/src/raumata/OperatingMode.h
+@@ -0,0 +1,67 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++namespace raumata {
++
++/**
++ * How this node shares one radio between Meshtastic and MeshCore.
++ *
++ * The radio stays on one physical configuration. The mode chooses which
++ * protocol family supplies that configuration, which stack may originate
++ * background traffic, and how the shared airtime budget is split.
++ */
++enum OperatingMode : uint8_t {
++    /// Meshtastic profile (sync 0x2B). Meshtastic presence and most airtime.
++    /// MeshCore stays up for the companion, but does not advertise.
++    MODE_MAINLY_MESHTASTIC = 0,
++    /// MeshCore profile (sync 0x12). MeshCore presence and most airtime.
++    /// Meshtastic background traffic (nodeinfo, position, telemetry) stays off.
++    MODE_MAINLY_MESHCORE = 1,
++    /// Both stacks advertise and send. Physical configuration is a Meshtastic preset.
++    MODE_SHARED_MESHTASTIC_PHY = 2,
++    /// Both stacks advertise and send. Physical configuration is a MeshCore preset.
++    MODE_SHARED_MESHCORE_PHY = 3,
++};
++
++OperatingMode activeOperatingMode();
++const char *operatingModeName(OperatingMode mode);
++bool parseOperatingModeName(const char *name, OperatingMode &out);
++
++bool operatingModeUsesMeshtasticPhy(OperatingMode mode);
++bool operatingModeUsesMeshCorePhy(OperatingMode mode);
++
++/// MeshCore's fraction of the regional duty cycle (the rest is Meshtastic's).
++float meshCoreAirtimeShare();
++
++/// Periodic MeshCore adverts. Explicit companion sends are still allowed.
++bool meshCorePresenceEnabled();
++
++/// Periodic Meshtastic NodeInfo from the presence scheduler.
++bool meshtasticPresenceEnabled();
++
++/// False for Meshtastic background packets while the node is mainly MeshCore.
++bool meshtasticPacketMayTransmit(uint8_t priority);
++
++/// True when the active mode may use this PhyProfileKind.
++bool profileKindAllowed(uint8_t kind);
++
++/// Remember a preset so switching back to its family restores it.
++void rememberProfileId(uint8_t id, uint8_t kind);
++
++/// Built-in preset to apply for this mode, preferring the last one the user chose.
++uint8_t defaultProfileIdForMode(OperatingMode mode);
++
++/**
++ * Load the mode from NVS. When no record exists, infer a shared mode from the
++ * saved profile so an existing dual node keeps both stacks on the air.
++ */
++OperatingMode loadOrInferOperatingMode(uint8_t savedKind, uint8_t savedSync, bool haveSavedProfile);
++
++/// Switch mode and, when the current profile is the wrong family, apply that family's preset.
++bool applyOperatingMode(OperatingMode mode);
++
++bool handleModeCliCommand(const char *command, char *reply, size_t replySize);
++
++} // namespace raumata
+diff --git a/src/raumata/PhyProfile.cpp b/src/raumata/PhyProfile.cpp
+index b148b333942fd02487f75420410663686450ecad..782a2fc6343e7ca81a6dd0dad7477db733753d66 100644
+--- a/src/raumata/PhyProfile.cpp
++++ b/src/raumata/PhyProfile.cpp
+@@ -1,6 +1,8 @@
+ #ifdef RAUMATA_DUAL_PROTOCOL
+ #include "PhyProfile.h"
+ 
++#include "OperatingMode.h"
++
+ #include <Arduino.h>
+ #include <Preferences.h>
+ #include <cmath>
+@@ -62,12 +64,6 @@ const PhyProfile kPresets[] = {
+     {13, "Portugal 868", PHY_MESHCORE_PRESET, meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST, 0,
+      meshtastic_Config_LoRaConfig_RegionCode_EU_868, 869.618f, 62.5f, 7, 6, kDefaultMeshCoreSyncWord,
+      kDefaultMeshCorePreamble, true, 22},
+-    {20, "Dual AU (common 0x2B)", PHY_DUAL_PRESET, meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST, 0,
+-     meshtastic_Config_LoRaConfig_RegionCode_ANZ, 916.575f, 62.5f, 7, 7, kDefaultMeshtasticSyncWord,
+-     kDefaultMeshCorePreamble, true, 22},
+-    {21, "Dual AU (common 0x12)", PHY_DUAL_PRESET, meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST, 0,
+-     meshtastic_Config_LoRaConfig_RegionCode_ANZ, 916.575f, 62.5f, 7, 7, kDefaultMeshCoreSyncWord,
+-     kDefaultMeshCorePreamble, true, 22},
+ };
+ 
+ PhyProfile gActiveProfile = kPresets[0];
+@@ -333,15 +329,28 @@ bool isApplyingPhyProfile()
+ void phyInit()
+ {
+     PhyProfile loaded = {};
+-    if (loadProfileFromNvs(loaded)) {
++    const bool haveSaved = loadProfileFromNvs(loaded);
++    loadOrInferOperatingMode(haveSaved ? static_cast<uint8_t>(loaded.kind) : 0,
++                             haveSaved ? loaded.sync_word : kDefaultMeshtasticSyncWord, haveSaved);
++
++    if (haveSaved) {
+         gActiveProfile = loaded;
+-        gApplyingProfile = true;
+-        writeProfileIntoLoRaConfig(gActiveProfile);
+-        gApplyingProfile = false;
+     } else {
+         gActiveProfile = deriveProfileFromMeshtasticConfig(kDefaultMeshtasticSyncWord, kDefaultMeshtasticPreamble);
+-        saveActiveProfileToNvs();
+     }
++
++    if (!profileKindAllowed(static_cast<uint8_t>(gActiveProfile.kind))) {
++        const PhyProfile *fallback = findPhyPreset(defaultProfileIdForMode(activeOperatingMode()));
++        if (fallback) {
++            gActiveProfile = *fallback;
++        }
++    }
++
++    gApplyingProfile = true;
++    writeProfileIntoLoRaConfig(gActiveProfile);
++    gApplyingProfile = false;
++    rememberProfileId(gActiveProfile.id, static_cast<uint8_t>(gActiveProfile.kind));
++    saveActiveProfileToNvs();
+ }
+ 
+ void bindPhyRadio(RadioInterface *radio, std::function<void()> onProfileChanged)
+@@ -357,11 +366,12 @@ void bindPhyRadio(RadioInterface *radio, std::function<void()> onProfileChanged)
+ bool applyPhyProfile(uint8_t id)
+ {
+     const PhyProfile *preset = findPhyPreset(id);
+-    if (!preset) {
++    if (!preset || !profileKindAllowed(static_cast<uint8_t>(preset->kind))) {
+         return false;
+     }
+ 
+     gActiveProfile = *preset;
++    rememberProfileId(preset->id, static_cast<uint8_t>(preset->kind));
+     return commitActiveProfileToHardware();
+ }
+ 
+@@ -372,22 +382,24 @@ bool applyCustomPhyProfile(float freq_mhz, float bw_khz, uint8_t sf, uint8_t cr,
+         return false;
+     }
+ 
+-    gActiveProfile.id = kPhyProfileCustomId;
+-    gActiveProfile.name = "Custom";
+-    gActiveProfile.kind = PHY_CUSTOM;
+-    gActiveProfile.msh_modem_preset = static_cast<uint8_t>(config.lora.modem_preset);
+-    gActiveProfile.msh_channel_num = 0;
+-    gActiveProfile.msh_region = static_cast<uint8_t>(config.lora.region);
+-    gActiveProfile.freq_mhz = freq_mhz;
+-    gActiveProfile.bw_khz = bw_khz;
+-    gActiveProfile.sf = sf;
+-    gActiveProfile.cr = cr;
+-    gActiveProfile.sync_word = sync_word;
+-    gActiveProfile.preamble = preamble;
+-    gActiveProfile.crc = true;
+-    gActiveProfile.tx_power = tx_power != 0 ? tx_power : gActiveProfile.tx_power;
+-
+-    return commitActiveProfileToHardware();
++    // A companion that sends CMD_SET_RADIO_PARAMS is asking for a known preset.
++    // The active mode decides which family is legal; unknown values stay off the radio.
++    for (const auto &preset : kPresets) {
++        if (!profileKindAllowed(static_cast<uint8_t>(preset.kind)) || preset.kind != PHY_MESHCORE_PRESET) {
++            continue;
++        }
++        if (std::fabs(preset.freq_mhz - freq_mhz) < 0.02f && std::fabs(preset.bw_khz - bw_khz) < 1.0f &&
++            preset.sf == sf && preset.cr == cr) {
++            if (!applyPhyProfile(preset.id)) {
++                return false;
++            }
++            if (tx_power != 0 && tx_power != activePhyProfile().tx_power) {
++                return applyTxPower(tx_power);
++            }
++            return true;
++        }
++    }
++    return false;
+ }
+ 
+ bool applyTxPower(int8_t tx_power)
+@@ -405,7 +417,30 @@ void onMeshtasticConfigChanged()
+         return;
+     }
+ 
+-    gActiveProfile = deriveProfileFromMeshtasticConfig(activeSyncWord(), activePreambleLength());
++    if (!profileKindAllowed(PHY_MESHTASTIC_PRESET)) {
++        gApplyingProfile = true;
++        writeProfileIntoLoRaConfig(gActiveProfile);
++        if (gRadio) {
++            gRadio->setSyncWord(activeSyncWord());
++            gRadio->setPreambleLength(activePreambleLength());
++        }
++        if (nodeDB) {
++            nodeDB->saveToDisk(SEGMENT_CONFIG);
++        }
++        gApplyingProfile = false;
++        return;
++    }
++
++    PhyProfile derived = deriveProfileFromMeshtasticConfig(activeSyncWord(), activePreambleLength());
++    if (derived.kind != PHY_MESHTASTIC_PRESET) {
++        const uint8_t id = gActiveProfile.kind == PHY_MESHTASTIC_PRESET ? gActiveProfile.id
++                                                                        : defaultProfileIdForMode(activeOperatingMode());
++        applyPhyProfile(id);
++        return;
++    }
++
++    gActiveProfile = derived;
++    rememberProfileId(gActiveProfile.id, static_cast<uint8_t>(gActiveProfile.kind));
+     if (gRadio) {
+         gRadio->setSyncWord(activeSyncWord());
+         gRadio->setPreambleLength(activePreambleLength());
+@@ -416,6 +451,13 @@ void onMeshtasticConfigChanged()
+     }
+ }
+ 
++void notifyOperatingModeChanged()
++{
++    if (gOnChanged) {
++        gOnChanged();
++    }
++}
++
+ bool handlePhyCliCommand(const char *command, char *reply, size_t replySize)
+ {
+     if (!command || !reply || replySize == 0) {
+@@ -435,9 +477,11 @@ bool handlePhyCliCommand(const char *command, char *reply, size_t replySize)
+         float effBw = gRadio ? gRadio->getBandwidthKHz() : gActiveProfile.bw_khz;
+         uint8_t effSf = gRadio ? gRadio->getSpreadFactorValue() : gActiveProfile.sf;
+         uint8_t effCr = gRadio ? gRadio->getCodingRateValue() : gActiveProfile.cr;
+-        snprintf(reply, replySize, "phy id=%u (%s, %s) %.3fMHz BW%.1f SF%u CR%u sync=0x%02X pre=%u pwr=%ddBm",
+-                 gActiveProfile.id, gActiveProfile.name, kindName(gActiveProfile.kind), effFreq, effBw, effSf, effCr,
+-                 activeSyncWord(), activePreambleLength(), gRadio ? gRadio->getTxPower() : gActiveProfile.tx_power);
++        snprintf(reply, replySize,
++                 "phy id=%u (%s, %s) mode=%s %.3fMHz BW%.1f SF%u CR%u sync=0x%02X pre=%u pwr=%ddBm",
++                 gActiveProfile.id, gActiveProfile.name, kindName(gActiveProfile.kind),
++                 operatingModeName(activeOperatingMode()), effFreq, effBw, effSf, effCr, activeSyncWord(),
++                 activePreambleLength(), gRadio ? gRadio->getTxPower() : gActiveProfile.tx_power);
+         return true;
+     }
+ 
+@@ -445,14 +489,22 @@ bool handlePhyCliCommand(const char *command, char *reply, size_t replySize)
+         size_t count = 0;
+         const PhyProfile *table = getPhyPresetTable(count);
+         size_t pos = 0;
++        bool any = false;
+         for (size_t i = 0; i < count && pos < replySize - 1; i++) {
+-            int written = snprintf(reply + pos, replySize - pos, "%s%u:%s(0x%02X)", i == 0 ? "" : ", ", table[i].id,
++            if (!profileKindAllowed(static_cast<uint8_t>(table[i].kind))) {
++                continue;
++            }
++            int written = snprintf(reply + pos, replySize - pos, "%s%u:%s(0x%02X)", any ? ", " : "", table[i].id,
+                                    table[i].name, table[i].sync_word);
++            any = true;
+             if (written < 0) {
+                 break;
+             }
+             pos += static_cast<size_t>(written);
+         }
++        if (!any) {
++            snprintf(reply, replySize, "none");
++        }
+         return true;
+     }
+ 
+@@ -476,7 +528,10 @@ bool handlePhyCliCommand(const char *command, char *reply, size_t replySize)
+                 snprintf(reply, replySize, "ok: custom %.3fMHz BW%.1f SF%u CR%u sync=0x%02X pre=%u", freq, bw, sf, cr,
+                          sync, preamble);
+             } else {
+-                snprintf(reply, replySize, "err: usage phy set custom <freq_mhz> <bw_khz> <sf> <cr> [sync_hex] [pre]");
++                snprintf(reply, replySize,
++                         "err: no %s preset matches; use phy set <id> (mode %s)",
++                         operatingModeUsesMeshCorePhy(activeOperatingMode()) ? "meshcore" : "meshtastic",
++                         operatingModeName(activeOperatingMode()));
+             }
+             return true;
+         }
+diff --git a/src/raumata/PhyProfile.h b/src/raumata/PhyProfile.h
+index 80c7f6d1f3f7b9448c918791b707575bcd6bc6a4..008424735a65f85f88a2d60c41bc7b3dd00e3129 100644
+--- a/src/raumata/PhyProfile.h
++++ b/src/raumata/PhyProfile.h
+@@ -77,6 +77,9 @@ bool applyTxPower(int8_t tx_power);
+ /// Synchronize the active PHY profile when the Meshtastic app modifies config.lora.
+ void onMeshtasticConfigChanged();
+ 
++/// Tell presence scheduling that the operating mode changed without a PHY rewrite.
++void notifyOperatingModeChanged();
++
+ /// Execute a "phy ..." CLI command and write a human-readable response into reply.
+ bool handlePhyCliCommand(const char *command, char *reply, size_t replySize);
+ 
+diff --git a/src/raumata/PresenceScheduler.cpp b/src/raumata/PresenceScheduler.cpp
+index a98ee1fc0ef278b2bf4afb84371a4f3ee76a2727..3e95958fc4e9158c1b60bc15191304a52bd7c650 100644
+--- a/src/raumata/PresenceScheduler.cpp
++++ b/src/raumata/PresenceScheduler.cpp
+@@ -4,6 +4,7 @@
+ #include <Arduino.h>
+ 
+ #include "MeshCoreNode.h"
++#include "OperatingMode.h"
+ #include "airtime.h"
+ #include "mesh/MeshRadio.h"
+ #include "mesh/NodeDB.h"
+@@ -31,7 +32,7 @@ void PresenceScheduler::loop(MeshCoreNode &node)
+ {
+     uint32_t now = millis();
+ 
+-    if (!bootMeshCoreSent_ && static_cast<int32_t>(now - nextMeshCoreAdvertMs_) >= 0) {
++    if (meshCorePresenceEnabled() && !bootMeshCoreSent_ && static_cast<int32_t>(now - nextMeshCoreAdvertMs_) >= 0) {
+         bootMeshCoreSent_ = true;
+         if (canSendBackgroundAdvert(250)) {
+             node.sendSelfAdvert(true);
+@@ -39,14 +40,16 @@ void PresenceScheduler::loop(MeshCoreNode &node)
+         nextMeshCoreAdvertMs_ = now + kPeriodicIntervalMs + jitterMs_;
+     }
+ 
+-    if (!bootMeshtasticSent_ && static_cast<int32_t>(now - nextMeshtasticNodeInfoMs_) >= 0) {
++    if (meshtasticPresenceEnabled() && !bootMeshtasticSent_ &&
++        static_cast<int32_t>(now - nextMeshtasticNodeInfoMs_) >= 0) {
+         bootMeshtasticSent_ = true;
+         if (nodeInfoModule && canSendBackgroundAdvert(250)) {
+             nodeInfoModule->sendOurNodeInfo(NODENUM_BROADCAST, false, 0, true);
+         }
+     }
+ 
+-    if (bootMeshCoreSent_ && pendingReAdvertMeshCore_ && static_cast<int32_t>(now - nextMeshCoreAdvertMs_) >= 0) {
++    if (meshCorePresenceEnabled() && bootMeshCoreSent_ && pendingReAdvertMeshCore_ &&
++        static_cast<int32_t>(now - nextMeshCoreAdvertMs_) >= 0) {
+         pendingReAdvertMeshCore_ = false;
+         if (canSendBackgroundAdvert(250)) {
+             node.sendSelfAdvert(true);
+@@ -54,7 +57,7 @@ void PresenceScheduler::loop(MeshCoreNode &node)
+         nextMeshCoreAdvertMs_ = now + kPeriodicIntervalMs + jitterMs_;
+     }
+ 
+-    if (bootMeshtasticSent_ && pendingReAdvertMeshtastic_ &&
++    if (meshtasticPresenceEnabled() && bootMeshtasticSent_ && pendingReAdvertMeshtastic_ &&
+         static_cast<int32_t>(now - nextMeshtasticNodeInfoMs_) >= 0) {
+         pendingReAdvertMeshtastic_ = false;
+         if (nodeInfoModule && canSendBackgroundAdvert(250)) {
+@@ -62,7 +65,8 @@ void PresenceScheduler::loop(MeshCoreNode &node)
+         }
+     }
+ 
+-    if (bootMeshCoreSent_ && !pendingReAdvertMeshCore_ && static_cast<int32_t>(now - nextMeshCoreAdvertMs_) >= 0) {
++    if (meshCorePresenceEnabled() && bootMeshCoreSent_ && !pendingReAdvertMeshCore_ &&
++        static_cast<int32_t>(now - nextMeshCoreAdvertMs_) >= 0) {
+         if (canSendBackgroundAdvert(250)) {
+             node.sendSelfAdvert(true);
+         }
+@@ -77,8 +81,8 @@ void PresenceScheduler::scheduleReAdvertise()
+         return;
+     }
+     lastReAdvertMs_ = now;
+-    pendingReAdvertMeshCore_ = true;
+-    pendingReAdvertMeshtastic_ = true;
++    pendingReAdvertMeshCore_ = meshCorePresenceEnabled();
++    pendingReAdvertMeshtastic_ = meshtasticPresenceEnabled();
+     nextMeshCoreAdvertMs_ = now + 5000UL;
+     nextMeshtasticNodeInfoMs_ = now + 10000UL;
+ }
+@@ -87,11 +91,11 @@ float PresenceScheduler::meshCoreBudgetFactor()
+ {
+     // Dispatcher uses duty_cycle = 1.0f / (1.0f + getAirtimeBudgetFactor()).
+     // Cap total channel TX utilization to the regional duty cycle (or 10% for
+-    // unrestricted regions) and give MeshCore kDefaultMeshCoreShare (25%).
++    // unrestricted regions) and give MeshCore the share selected by the operating mode.
+     float regionDuty = (myRegion && myRegion->dutyCycle > 0.0f && myRegion->dutyCycle < 100.0f)
+                            ? (myRegion->dutyCycle / 100.0f)
+                            : 0.10f;
+-    float mcDuty = regionDuty * kDefaultMeshCoreShare;
++    float mcDuty = regionDuty * meshCoreAirtimeShare();
+     if (mcDuty <= 0.0005f) {
+         mcDuty = 0.0005f;
+     }
+diff --git a/src/raumata/PresenceScheduler.h b/src/raumata/PresenceScheduler.h
+index 6588c27e391790435f84ca137d1278984c0826e8..9a016aa940f022056add7de6264195cd76b56937 100644
+--- a/src/raumata/PresenceScheduler.h
++++ b/src/raumata/PresenceScheduler.h
+@@ -13,8 +13,8 @@ class MeshCoreNode;
+  * - Schedules periodic MeshCore adverts every 15 minutes with deterministic per-node
+  *   jitter so dual nodes do not synchronize bursts.
+  * - Rate-limits re-advertisements triggered by PHY profile or owner changes.
+- * - Computes the MeshCore Dispatcher airtime budget factor so MeshCore stays within its
+- *   allocated share (default 25%) of the regional duty cycle.
++ * - Computes the MeshCore Dispatcher airtime budget factor from the operating mode
++ *   (10% when mainly Meshtastic, 90% when mainly MeshCore, 50% when both are active).
+  */
+ class PresenceScheduler
+ {
+@@ -23,7 +23,6 @@ class PresenceScheduler
+     static constexpr uint32_t kBootMeshtasticDelayMs = 20UL * 1000UL;
+     static constexpr uint32_t kPeriodicIntervalMs = 15UL * 60UL * 1000UL;
+     static constexpr uint32_t kReAdvertCooldownMs = 60UL * 1000UL;
+-    static constexpr float kDefaultMeshCoreShare = 0.25f;
+ 
+     void begin(MeshCoreNode &node);
+     void loop(MeshCoreNode &node);

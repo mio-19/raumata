@@ -1,14 +1,35 @@
 # Shared PHY profiles and preset selection
 
-Status: implemented in `0002-radio-add-raw-frame-hook-and-shared-ownership.patch` and `0006-raumata-add-shared-phy-profiles-and-preset-selection.patch`.
+Status: profiles are implemented in `0002-radio-add-raw-frame-hook-and-shared-ownership.patch` and `0006-raumata-add-shared-phy-profiles-and-preset-selection.patch`. Operating modes are implemented in `0011-raumata-choose-a-native-profile-and-which-protocol-o.patch`.
 
 The radio stays in **one physical configuration** continuously. There is no
 per-protocol retuning and no time slicing. That one configuration is a
 complete LoRa PHY profile, and both Meshtastic and MeshCore use it.
 
-The profile can be selected from the Meshtastic preset family, the MeshCore
-preset family, a dual preset, or a custom set of values. The node keeps the
-selected profile until the user changes it.
+The operating mode chooses which family supplies that configuration:
+
+| Mode | Wire name | Physical configuration | Background traffic |
+| --- | --- | --- | --- |
+| Mainly Meshtastic | `mainly-meshtastic` | A Meshtastic preset (sync `0x2B`, preamble 16) | Meshtastic. MeshCore does not advertise. Companion sends still go out. About 90% / 10% airtime. |
+| Mainly MeshCore | `mainly-meshcore` | A MeshCore preset (sync `0x12`, preamble 32) | MeshCore. Meshtastic nodeinfo, position, and telemetry stay off. Phone-originated Meshtastic messages still go out. About 10% / 90% airtime. |
+| Both on a Meshtastic profile | `shared-meshtastic` | A Meshtastic preset | Both stacks advertise. About 50% / 50% airtime. |
+| Both on a MeshCore profile | `shared-meshcore` | A MeshCore preset | Both stacks advertise. About 50% / 50% airtime. |
+
+The mode is stored in NVS (`raumata/mode`) with the last preset chosen for each
+family, so switching back restores it. A profile from the other family is
+rejected. Stock peers of the selected family hear the node; stock peers of the
+other family do not, because one radio has one sync word.
+
+Set the mode from the MeshCore companion with custom var `mode`, or
+`mode set <name>` over `CMD_RUN_CLI_COMMAND`. Set the preset with custom var
+`phy.id` or `phy set <id>`. `CMD_GET_CUSTOM_VARS` reports `mode`, `phy.id`,
+`phy.name`, and `phy.sync`. The Android MeshCore tab exposes the same choices.
+
+A node that already had a saved profile and no mode record keeps both stacks
+active. A MeshCore preset (or an older dual/custom profile whose sync word is
+`0x12`) becomes `shared-meshcore`. Anything else becomes `shared-meshtastic`,
+and a profile that is not a native preset of that family is replaced by the
+regional default.
 
 ## 1. What a “physical configuration” includes
 
@@ -53,7 +74,8 @@ struct PhyProfile {
     uint16_t msh_channel_num;
     uint8_t  msh_region;       // hint/validation
 
-    // Explicit PHY fields (MeshCore, dual, custom)
+    // Explicit PHY fields. MeshCore presets fill these in.
+    // PHY_DUAL_PRESET and PHY_CUSTOM remain so an old NVS record can be migrated.
     float    freq_mhz;
     float    bw_khz;
     uint8_t  sf;
@@ -67,7 +89,7 @@ struct PhyProfile {
 
 For a Meshtastic preset, the frequency is computed by Meshtastic from the
 region and channel, so `freq_mhz` can be zero and the active frequency is read
-back from the radio. For MeshCore/dual/custom profiles, `freq_mhz` is explicit
+back from the radio. For a MeshCore preset, `freq_mhz` is explicit
 and Meshtastic is configured with `use_preset=false`, manual BW/SF/CR, and
 `override_frequency`.
 
@@ -82,9 +104,12 @@ and Meshtastic is configured with `use_preset=false`, manual BW/SF/CR, and
 | 11 | MeshCore | New Zealand (Narrow) | 917.375 MHz | 62.5 | 7 | 5 | 0x12 | 32 |
 | 12 | MeshCore | US/Canada (Narrow) | 910.525 MHz | 62.5 | 7 | 5 | 0x12 | 32 |
 | 13 | MeshCore | Portugal 868 | 869.618 MHz | 62.5 | 7 | 6 | 0x12 | 32 |
-| 20 | Dual | Dual AU (common 0x2B) | 916.575 MHz | 62.5 | 7 | 7 | 0x2B | 32 |
-| 21 | Dual | Dual AU (common 0x12) | 916.575 MHz | 62.5 | 7 | 7 | 0x12 | 32 |
-| 255 | Custom | User-defined | user | user | user | user | user | user |
+
+Older dual presets (ids 20 and 21) and free-form custom PHY values are not
+selectable. Shared operation is the operating mode above, and the physical
+configuration is always one of these native presets. `CMD_SET_RADIO_PARAMS`
+selects a MeshCore preset only when the active mode uses the MeshCore family
+and the frequency, bandwidth, spreading factor, and coding rate match.
 
 The table is data, not hard-coded control flow. Adding a preset should not
 require changes to the radio or companion code.
@@ -96,9 +121,8 @@ trade-off:
 
 | Selected profile | Sync word | Standard Meshtastic peers | Standard MeshCore peers |
 | --- | --- | --- | --- |
-| Meshtastic preset | 0x2B | Hear it | Need a Raumata/patched MeshCore using 0x2B |
-| MeshCore preset | 0x12 | Need a Raumata/patched Meshtastic using 0x12 | Hear it |
-| Dual preset | chosen common value | Hear it only if the common value is 0x2B | Hear it only if the common value is 0x12 |
+| Meshtastic preset, including both-on-Meshtastic-profile | 0x2B | Hear it | Need a Raumata/patched MeshCore using 0x2B |
+| MeshCore preset, including both-on-MeshCore-profile | 0x12 | Need a Raumata/patched Meshtastic using 0x12 | Hear it |
 
 There is no single sync word that makes *standard* Meshtastic and *standard*
 MeshCore peers both hear the same transmission. The choices are:
@@ -106,20 +130,17 @@ MeshCore peers both hear the same transmission. The choices are:
 1. **Native preset:** use the preset family's native sync word (0x2B for
    Meshtastic, 0x12 for MeshCore). The selected protocol is standard; the
    other side needs matching firmware/configuration.
-2. **Dual preset:** choose a common sync word (usually 0x2B to keep Meshtastic
-   standard, or 0x12 to keep MeshCore standard) and use it for both stacks.
-   Both sides must run matching firmware/configuration.
+2. **Shared mode on one native profile:** both stacks use that profile's sync
+   word. Stock peers of the other family do not hear the node.
 3. **Two radios:** the only way to be standard on both networks at once.
 
-The profile table should include dual presets for common deployments and make
-the sync word visible in the UI/API. Do not silently rewrite a MeshCore
-preset's sync word to 0x2B; that would make it look native while behaving
-non-natively.
+The companion lists only the presets the active mode allows, and it reports
+the sync word. Do not silently rewrite a MeshCore preset's sync word to 0x2B,
+or a Meshtastic preset's sync word to 0x12.
 
-Preamble has the same issue, though it is less brittle: MeshCore uses 32
-symbols for SF ≤ 8, Meshtastic uses 16. A dual/SF7 profile should use 32;
-a standard Meshtastic LongFast profile uses 16. Make preamble part of the
-profile and report it.
+Preamble has the same issue, though it is less brittle: MeshCore presets use
+32 symbols, Meshtastic presets use 16. Make preamble part of the profile and
+report it.
 
 ## 4. Applying a profile
 
@@ -134,7 +155,7 @@ profile and report it.
    - `config.lora.modem_preset = profile.msh_modem_preset`
    - `config.lora.channel_num = profile.msh_channel_num`
    - `config.lora.override_frequency = 0`
-3. If it is a MeshCore/dual/custom profile:
+3. If it is a MeshCore preset:
    - `config.lora.use_preset = false`
    - `config.lora.bandwidth = bwKHzToCode(profile.bw_khz)`
    - `config.lora.spread_factor = profile.sf`
@@ -154,7 +175,7 @@ in the profile and make `RadioLibInterface` read them:
 
 ### 4.2 Runtime profile change
 
-`raumata::applyPhyProfile(id_or_custom)`:
+`raumata::applyPhyProfile(id)` rejects a preset from the other family.
 
 1. Validate the profile against the region and hardware limits.
 2. Update `config.lora` as in 4.1.
@@ -162,8 +183,7 @@ in the profile and make `RadioLibInterface` read them:
    `service->reloadConfig(SEGMENT_CONFIG)`).
 4. Update the radio's sync word/preamble and call `RadioInterface::reconfigure()`.
 5. Persist the profile in NVS.
-6. Schedule a MeshCore advert and a Meshtastic NodeInfo after a short delay so
-   the new PHY is announced to both networks.
+6. Schedule a re-advertisement for the stacks the active mode allows to announce.
 
 The radio reconfigures once. Both stacks continue on the new configuration;
 there is no per-protocol switching.
@@ -172,12 +192,11 @@ there is no per-protocol switching.
 
 If the Meshtastic app changes the radio settings:
 
-- If it selects a Meshtastic preset, map it to a `PHY_MESHTASTIC_PRESET`
-  profile; sync/preamble come from that preset (0x2B/16).
-- If it uses manual BW/SF/CR/frequency, map it to `PHY_CUSTOM`; keep the
-  current sync word/preamble unless the user also changes the profile.
-- Update the shared profile and re-advertise. Use an `applyingProfile` guard
-  to avoid a config-change feedback loop.
+- If the mode uses a Meshtastic profile and the app selects a Meshtastic
+  preset, map it to that preset. Sync and preamble stay 0x2B and 16.
+- Manual BW/SF/CR/frequency is put back to the active Meshtastic preset.
+  A MeshCore-profile mode puts the radio back to the active MeshCore preset.
+- Use an `applyingProfile` guard to avoid a config-change feedback loop.
 
 The MeshCore companion's self-info (`CMD_APP_START`) should report the
 effective frequency/BW/SF/CR read from the radio, so a MeshCore app sees the
@@ -194,11 +213,12 @@ Add custom commands (IDs outside MeshCore's assigned range, or use
 - `CMD_SET_PHY_PROFILE` — select by ID.
 - `CMD_GET_PHY_PROFILE` — report the active profile and effective
   frequency/BW/SF/CR/sync/preamble.
-- `CMD_SET_RADIO_PARAMS` (existing MeshCore command) — create/update a
-  `PHY_CUSTOM` profile from frequency/BW/SF/CR. Keep the current sync/preamble
-  unless a new `SDL_SET_PHY_SYNC`/`CMD_SET_PHY_SYNC` command is used.
-- `CMD_RUN_CLI_COMMAND` text aliases: `phy list`, `phy get`, `phy set <id>`,
-  `phy set custom <freq> <bw> <sf> <cr> <sync> <preamble>`.
+- `CMD_SET_RADIO_PARAMS` (existing MeshCore command) — select a MeshCore
+  preset when the mode uses the MeshCore family and frequency, bandwidth,
+  spreading factor, and coding rate match. Otherwise reject it.
+- `CMD_RUN_CLI_COMMAND` text aliases: `mode get|list|set <name>`,
+  `phy list`, `phy get`, `phy set <id>`. `phy list` shows only presets the
+  active mode allows.
 
 The MeshCore companion app will only expose the commands it knows; a custom
 app or the CLI can use the rest. The existing `CMD_APP_START` response already
@@ -208,9 +228,8 @@ carries frequency/BW/SF/CR, so standard apps show the effective PHY.
 
 - The existing radio configuration screen can select Meshtastic presets and
   manual BW/SF/CR/frequency; that is enough for Meshtastic-native profiles.
-- Sync word/preamble are not in Meshtastic's protobuf. Use the MeshCore
-  companion/CLI or add a custom `ClientNotification`/admin command for native
-  MeshCore/dual profiles.
+- Sync word and preamble are not in Meshtastic's protobuf. Select a MeshCore
+  profile from the MeshCore companion or CLI.
 - On any profile change, emit a `ClientNotification` (or a custom port
   message) so custom clients can refresh the displayed PHY.
 
@@ -222,8 +241,8 @@ carries frequency/BW/SF/CR, so standard apps show the effective PHY.
   calculation. Use `override_frequency` and keep a region hint for power and
   duty-cycle limits; do not bypass regulatory limits silently.
 - AU 915–928 MHz, NZ, and EU 868 MeshCore presets fit existing Meshtastic
-  regions (ANZ / EU_868) for power limits. Out-of-region custom profiles are
-  the user's responsibility.
+  regions (ANZ / EU_868) for power limits. A preset outside the device's
+  regulatory region is the user's responsibility.
 - Re-advertising after a profile change consumes airtime; rate-limit it.
 
 ## 7. Implementation patch breakdown
@@ -236,10 +255,11 @@ After the current dual-protocol series:
    - `RadioLibInterface` fields initialized from the profile; `reconfigure()`
      uses them; no behavior change for non-dual builds.
 3. `raumata: apply the profile before radio init`
-   - `phyInit()` in `main.cpp`; map Meshtastic/MeshCore/dual profiles into
+   - `phyInit()` in `main.cpp`; map the selected family's profile into
      `config.lora`; build check.
 4. `raumata: expose preset selection through the companion API`
-   - custom commands + CLI; `CMD_SET_RADIO_PARAMS` creates a custom profile.
+   - custom commands + CLI. `CMD_SET_RADIO_PARAMS` selects a matching MeshCore
+     preset when that family is active.
 5. `raumata: persist runtime radio changes and re-advertise`
    - config observer, `applyPhyProfile()`, re-advertise both stacks.
 6. `docs: document shared PHY profiles`
@@ -257,8 +277,8 @@ Each patch should build for `heltec-v3-dual`.
     a Raumata MeshCore node with the same sync hears the MeshCore side.
   - MeshCore preset: a standard MeshCore node hears the MeshCore side; a
     Raumata Meshtastic node with the same sync hears the Meshtastic side.
-  - Dual preset: both Raumata sides hear each other; document which standard
-    peers do not.
+  - Shared mode: both Raumata stacks hear each other on the selected family's
+    sync word. Stock peers of the other family do not.
 - Verify no retuning occurs during normal operation; only explicit profile
   changes reconfigure the radio.
 - Measure airtime for each preset and verify the shared budget/region limits.
@@ -267,10 +287,10 @@ Each patch should build for `heltec-v3-dual`.
 
 ## 9. Recommendation
 
-- Make the profile a first-class NVS record and expose both preset families.
-- Keep the native sync word for native presets; provide explicit dual presets
-  with a common sync word instead of silently rewriting one family's preset.
-- Default the dual build to a dual preset only if the deployment controls both
-  networks; otherwise let the user choose.
+- Make the operating mode and the profile first-class NVS records.
+- Keep each family's native sync word. Do not rewrite a MeshCore preset to
+  `0x2B` or a Meshtastic preset to `0x12`.
+- Default a node with no saved mode to both stacks on a Meshtastic profile,
+  unless the saved profile is already MeshCore.
 - Document that standard Meshtastic and standard MeshCore cannot both be
   reached by one radio with one sync word.

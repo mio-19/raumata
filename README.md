@@ -17,8 +17,16 @@ The first series turns the Heltec V3 firmware into a shared-PHY dual-protocol
 node:
 
 - Meshtastic and [MeshCore](https://github.com/ripplebiz/MeshCore) both run on
-  the same SX1262 and the same selectable LoRa PHY profile (Meshtastic preset,
-  MeshCore preset, dual preset, or custom PHY).
+  the same SX1262. An operating mode picks the physical configuration and who
+  owns the air:
+  - **Mainly Meshtastic** — a Meshtastic preset. Meshtastic presence; MeshCore
+    does not advertise.
+  - **Mainly MeshCore** — a MeshCore preset. MeshCore presence; Meshtastic
+    background traffic stays off.
+  - **Both, Meshtastic profile** — both protocols on a Meshtastic physical
+    configuration.
+  - **Both, MeshCore profile** — both protocols on a MeshCore physical
+    configuration.
 - MeshCore frames carry the four-byte `RAUM` transport tag so they can be
   demultiplexed from Meshtastic frames on receive.
 - MeshCore's identity, contacts, channels, and identity-link record persist in
