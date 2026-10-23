@@ -1,0 +1,906 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mio <mio@mio19.uk>
+Date: Fri, 23 Oct 2026 11:09:48 +1100
+Subject: [PATCH] raumata: add shared PHY profiles and preset selection
+
+Add a first-class PhyProfile table and NVS persistence (raumata/phy) covering Meshtastic presets, MeshCore narrow presets, dual presets (0x2B and 0x12 sync words), and user-defined custom profiles.
+
+- Apply the active profile in phyInit() before initLoRa() and drive RadioInterface syncWord and preambleLength from the profile.
+- Expose preset selection and custom radio parameters through companion commands (CMD_SET_RADIO_PARAMS, CMD_SET_RADIO_TX_POWER, CMD_GET_PHY_PROFILES, CMD_GET_PHY_PROFILE, CMD_SET_PHY_PROFILE) and the 'phy' CLI command.
+
+diff --git a/src/main.cpp b/src/main.cpp
+index 9560295b482accb5f989a07a3d4d12a2468d6d5c..28d0287257e0c3534e62e9b52d1a398fdc9e06d8 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -989,6 +989,9 @@ void setup()
+ #endif
+ #endif
+ 
++#ifdef RAUMATA_DUAL_PROTOCOL
++    raumata::phyInit();
++#endif
+     auto rIf = initLoRa();
+ #ifdef RAUMATA_DUAL_PROTOCOL
+     RadioInterface *raumataRadio = rIf.get();
+diff --git a/src/mesh/RadioInterface.cpp b/src/mesh/RadioInterface.cpp
+index 2a5ae3222847b45286e8eb674e0b8d05ba51f0df..72deaff05aad4cc6639e1513778bdd211e0b5a0d 100644
+--- a/src/mesh/RadioInterface.cpp
++++ b/src/mesh/RadioInterface.cpp
+@@ -32,6 +32,10 @@
+ #include "STM32WLE5JCInterface.h"
+ #endif
+ 
++#ifdef RAUMATA_DUAL_PROTOCOL
++#include "raumata/PhyProfile.h"
++#endif
++
+ Observable<uint32_t> RadioInterface::loraRxPacketObservable;
+ 
+ #define RDEF(name, freq_start, freq_end, duty_cycle, spacing, power_limit, audio_permitted, frequency_switching, wide_lora)      \
+@@ -870,6 +874,11 @@ void RadioInterface::applyModemConfig()
+     saveChannelNum(channel_num);
+     saveFreq(freq + loraConfig.frequency_offset);
+ 
++#ifdef RAUMATA_DUAL_PROTOCOL
++    setSyncWord(raumata::activeSyncWord());
++    setPreambleLength(raumata::activePreambleLength());
++#endif
++
+     slotTimeMsec = computeSlotTimeMsec();
+     preambleTimeMsec = preambleLength * (pow_of_2(sf) / bw);
+ 
+diff --git a/src/raumata/MeshCoreNode.cpp b/src/raumata/MeshCoreNode.cpp
+index 958a1bc24029909774314c04c7bee177cc44d501..3a326fb4fff0a52e0ad2f1a54255225900cd81ef 100644
+--- a/src/raumata/MeshCoreNode.cpp
++++ b/src/raumata/MeshCoreNode.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include "CompanionProtocol.h"
+ #include "FSCommon.h"
++#include "PhyProfile.h"
+ #include "PowerStatus.h"
+ #include "gps/RTC.h"
+ #include "mesh/NodeDB.h"
+@@ -366,9 +367,12 @@ void MeshCoreNode::onCLICommandRecv(const ContactInfo &contact, mesh::Packet *pa
+     (void)contact;
+     (void)packet;
+     (void)senderTimestamp;
+-    (void)text;
+-    if (reply) {
+-        reply[0] = 0;
++    if (!reply) {
++        return;
++    }
++    reply[0] = 0;
++    if (text) {
++        handlePhyCliCommand(text, reply, 150);
+     }
+ }
+ 
+@@ -714,6 +718,75 @@ void MeshCoreNode::writeStats(uint8_t statsType)
+     writer_(frame, i);
+ }
+ 
++void MeshCoreNode::writePhyProfiles()
++{
++    size_t count = 0;
++    const PhyProfile *table = getPhyPresetTable(count);
++
++    uint8_t frame[MAX_FRAME_SIZE];
++    int i = 0;
++    frame[i++] = RESP_CODE_PHY_PROFILES;
++    frame[i++] = activePhyProfile().id;
++    frame[i++] = static_cast<uint8_t>(count);
++
++    for (size_t idx = 0; idx < count; idx++) {
++        // Compact per-preset entry: id(1) + kind(1) + sync(1) + sf(1) + cr(1) + preamble(2) + freq_khz(4) + bw_hz(4) = 15 bytes
++        if (i + 15 > static_cast<int>(sizeof(frame))) {
++            break;
++        }
++        const PhyProfile &p = table[idx];
++        frame[i++] = p.id;
++        frame[i++] = static_cast<uint8_t>(p.kind);
++        frame[i++] = p.sync_word;
++        frame[i++] = p.sf;
++        frame[i++] = p.cr;
++        memcpy(&frame[i], &p.preamble, 2);
++        i += 2;
++        uint32_t freqKhz = static_cast<uint32_t>(p.freq_mhz * 1000.0f);
++        uint32_t bwHz = static_cast<uint32_t>(p.bw_khz * 1000.0f);
++        memcpy(&frame[i], &freqKhz, 4);
++        i += 4;
++        memcpy(&frame[i], &bwHz, 4);
++        i += 4;
++    }
++
++    writer_(frame, i);
++}
++
++void MeshCoreNode::writeActivePhyProfile()
++{
++    const PhyProfile &p = activePhyProfile();
++    uint8_t frame[MAX_FRAME_SIZE];
++    int i = 0;
++
++    frame[i++] = RESP_CODE_PHY_PROFILE;
++    frame[i++] = p.id;
++    frame[i++] = static_cast<uint8_t>(p.kind);
++
++    uint32_t freqKhz = static_cast<uint32_t>(meshtasticRadio_.getFreq() * 1000.0f);
++    uint32_t bwHz = static_cast<uint32_t>(meshtasticRadio_.getBandwidthKHz() * 1000.0f);
++    memcpy(&frame[i], &freqKhz, 4);
++    i += 4;
++    memcpy(&frame[i], &bwHz, 4);
++    i += 4;
++    frame[i++] = meshtasticRadio_.getSpreadFactorValue();
++    frame[i++] = meshtasticRadio_.getCodingRateValue();
++    frame[i++] = activeSyncWord();
++    uint16_t preamble = activePreambleLength();
++    memcpy(&frame[i], &preamble, 2);
++    i += 2;
++    frame[i++] = static_cast<uint8_t>(meshtasticRadio_.getTxPower());
++
++    size_t nameLen = strlen(p.name);
++    if (i + static_cast<int>(nameLen) > static_cast<int>(sizeof(frame))) {
++        nameLen = sizeof(frame) - i;
++    }
++    memcpy(&frame[i], p.name, nameLen);
++    i += static_cast<int>(nameLen);
++
++    writer_(frame, i);
++}
++
+ void MeshCoreNode::handleCompanionFrame(const uint8_t *frame, size_t len)
+ {
+     if (len < 1) {
+@@ -1025,9 +1098,105 @@ void MeshCoreNode::handleCommand(uint8_t command, const uint8_t *frame, size_t l
+         break;
+ 
+     case CMD_SET_RADIO_PARAMS:
++        if (len >= 11) {
++            uint32_t freqKhz = 0;
++            uint32_t bwHz = 0;
++            memcpy(&freqKhz, &frame[1], 4);
++            memcpy(&bwHz, &frame[5], 4);
++            uint8_t sf = frame[9];
++            uint8_t cr = frame[10];
++            uint8_t sync = len >= 12 ? frame[11] : activeSyncWord();
++            uint16_t preamble = activePreambleLength();
++            if (len >= 14) {
++                memcpy(&preamble, &frame[12], 2);
++            }
++            if (applyCustomPhyProfile(static_cast<float>(freqKhz) / 1000.0f, static_cast<float>(bwHz) / 1000.0f, sf,
++                                      cr, sync, preamble, activePhyProfile().tx_power)) {
++                writeOK();
++            } else {
++                writeError(ERR_CODE_ILLEGAL_ARG);
++            }
++        } else {
++            writeError(ERR_CODE_ILLEGAL_ARG);
++        }
++        break;
++
+     case CMD_SET_RADIO_TX_POWER:
+-        // Replaced by shared PHY profile handling in the PHY series patch.
+-        writeError(ERR_CODE_UNSUPPORTED_CMD);
++        if (len >= 2) {
++            if (applyTxPower(static_cast<int8_t>(frame[1]))) {
++                writeOK();
++            } else {
++                writeError(ERR_CODE_ILLEGAL_ARG);
++            }
++        } else {
++            writeError(ERR_CODE_ILLEGAL_ARG);
++        }
++        break;
++
++    case CMD_GET_PHY_PROFILES:
++        writePhyProfiles();
++        break;
++
++    case CMD_GET_PHY_PROFILE:
++        writeActivePhyProfile();
++        break;
++
++    case CMD_SET_PHY_PROFILE:
++        if (len >= 2) {
++            uint8_t id = frame[1];
++            if (id == kPhyProfileCustomId) {
++                if (len >= 15) {
++                    uint32_t freqKhz = 0;
++                    uint32_t bwHz = 0;
++                    memcpy(&freqKhz, &frame[2], 4);
++                    memcpy(&bwHz, &frame[6], 4);
++                    uint8_t sf = frame[10];
++                    uint8_t cr = frame[11];
++                    uint8_t sync = frame[12];
++                    uint16_t preamble = 0;
++                    memcpy(&preamble, &frame[13], 2);
++                    int8_t txPower = len >= 16 ? static_cast<int8_t>(frame[15]) : activePhyProfile().tx_power;
++                    if (applyCustomPhyProfile(static_cast<float>(freqKhz) / 1000.0f,
++                                              static_cast<float>(bwHz) / 1000.0f, sf, cr, sync, preamble, txPower)) {
++                        writeOK();
++                    } else {
++                        writeError(ERR_CODE_ILLEGAL_ARG);
++                    }
++                } else {
++                    writeError(ERR_CODE_ILLEGAL_ARG);
++                }
++            } else if (applyPhyProfile(id)) {
++                writeOK();
++            } else {
++                writeError(ERR_CODE_NOT_FOUND);
++            }
++        } else {
++            writeError(ERR_CODE_ILLEGAL_ARG);
++        }
++        break;
++
++    case CMD_RUN_CLI_COMMAND:
++        if (len >= 2) {
++            char cmd[128];
++            size_t cmdLen = len - 1;
++            if (cmdLen > sizeof(cmd) - 1) {
++                cmdLen = sizeof(cmd) - 1;
++            }
++            memcpy(cmd, &frame[1], cmdLen);
++            cmd[cmdLen] = 0;
++
++            uint8_t replyFrame[MAX_FRAME_SIZE];
++            replyFrame[0] = RESP_CODE_CLI_REPLY;
++            char *replyText = reinterpret_cast<char *>(&replyFrame[1]);
++            replyText[0] = 0;
++            if (handlePhyCliCommand(cmd, replyText, sizeof(replyFrame) - 1)) {
++                writer_(replyFrame, 1 + strlen(replyText));
++            } else {
++                writeError(ERR_CODE_UNSUPPORTED_CMD);
++            }
++        } else {
++            writeError(ERR_CODE_ILLEGAL_ARG);
++        }
+         break;
+ 
+     default:
+diff --git a/src/raumata/MeshCoreNode.h b/src/raumata/MeshCoreNode.h
+index a88acda76153f402500a152ef26ed227918aa2db..4af2cee8205fa4ba6a8a66a344f42ed9e5e88937 100644
+--- a/src/raumata/MeshCoreNode.h
++++ b/src/raumata/MeshCoreNode.h
+@@ -107,6 +107,8 @@ class MeshCoreNode : public BaseChatMesh
+     void writeChannel(uint8_t idx);
+     void writeNextMessage();
+     void writeStats(uint8_t statsType);
++    void writePhyProfiles();
++    void writeActivePhyProfile();
+     void writeContactFrame(uint8_t code, const ContactInfo &contact);
+ 
+     void handleCommand(uint8_t command, const uint8_t *frame, size_t len);
+diff --git a/src/raumata/PhyProfile.cpp b/src/raumata/PhyProfile.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..b148b333942fd02487f75420410663686450ecad
+--- /dev/null
++++ b/src/raumata/PhyProfile.cpp
+@@ -0,0 +1,500 @@
++#ifdef RAUMATA_DUAL_PROTOCOL
++#include "PhyProfile.h"
++
++#include <Arduino.h>
++#include <Preferences.h>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++#include "mesh/MeshRadio.h"
++#include "mesh/MeshService.h"
++#include "mesh/NodeDB.h"
++
++namespace raumata {
++namespace {
++
++struct SavedPhyRecord {
++    uint8_t version;
++    uint8_t id;
++    uint8_t kind;
++    uint8_t msh_modem_preset;
++    uint16_t msh_channel_num;
++    uint8_t msh_region;
++    float freq_mhz;
++    float bw_khz;
++    uint8_t sf;
++    uint8_t cr;
++    uint8_t sync_word;
++    uint16_t preamble;
++    uint8_t crc;
++    int8_t tx_power;
++};
++
++constexpr uint8_t kSavedPhyVersion = 1;
++
++const PhyProfile kPresets[] = {
++    {1, "ANZ LongFast", PHY_MESHTASTIC_PRESET, meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST, 0,
++     meshtastic_Config_LoRaConfig_RegionCode_ANZ, 0.0f, 250.0f, 11, 5, kDefaultMeshtasticSyncWord,
++     kDefaultMeshtasticPreamble, true, 22},
++    {2, "ANZ MediumSlow", PHY_MESHTASTIC_PRESET, meshtastic_Config_LoRaConfig_ModemPreset_MEDIUM_SLOW, 0,
++     meshtastic_Config_LoRaConfig_RegionCode_ANZ, 0.0f, 250.0f, 10, 5, kDefaultMeshtasticSyncWord,
++     kDefaultMeshtasticPreamble, true, 22},
++    {3, "ANZ ShortFast", PHY_MESHTASTIC_PRESET, meshtastic_Config_LoRaConfig_ModemPreset_SHORT_FAST, 0,
++     meshtastic_Config_LoRaConfig_RegionCode_ANZ, 0.0f, 250.0f, 7, 5, kDefaultMeshtasticSyncWord,
++     kDefaultMeshtasticPreamble, true, 22},
++    {4, "US LongFast", PHY_MESHTASTIC_PRESET, meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST, 0,
++     meshtastic_Config_LoRaConfig_RegionCode_US, 0.0f, 250.0f, 11, 5, kDefaultMeshtasticSyncWord,
++     kDefaultMeshtasticPreamble, true, 22},
++    {5, "EU868 LongFast", PHY_MESHTASTIC_PRESET, meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST, 0,
++     meshtastic_Config_LoRaConfig_RegionCode_EU_868, 0.0f, 250.0f, 11, 5, kDefaultMeshtasticSyncWord,
++     kDefaultMeshtasticPreamble, true, 22},
++    {10, "Australia (Narrow)", PHY_MESHCORE_PRESET, meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST, 0,
++     meshtastic_Config_LoRaConfig_RegionCode_ANZ, 916.575f, 62.5f, 7, 7, kDefaultMeshCoreSyncWord,
++     kDefaultMeshCorePreamble, true, 22},
++    {11, "New Zealand (Narrow)", PHY_MESHCORE_PRESET, meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST, 0,
++     meshtastic_Config_LoRaConfig_RegionCode_ANZ, 917.375f, 62.5f, 7, 5, kDefaultMeshCoreSyncWord,
++     kDefaultMeshCorePreamble, true, 22},
++    {12, "US/Canada (Narrow)", PHY_MESHCORE_PRESET, meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST, 0,
++     meshtastic_Config_LoRaConfig_RegionCode_US, 910.525f, 62.5f, 7, 5, kDefaultMeshCoreSyncWord,
++     kDefaultMeshCorePreamble, true, 22},
++    {13, "Portugal 868", PHY_MESHCORE_PRESET, meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST, 0,
++     meshtastic_Config_LoRaConfig_RegionCode_EU_868, 869.618f, 62.5f, 7, 6, kDefaultMeshCoreSyncWord,
++     kDefaultMeshCorePreamble, true, 22},
++    {20, "Dual AU (common 0x2B)", PHY_DUAL_PRESET, meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST, 0,
++     meshtastic_Config_LoRaConfig_RegionCode_ANZ, 916.575f, 62.5f, 7, 7, kDefaultMeshtasticSyncWord,
++     kDefaultMeshCorePreamble, true, 22},
++    {21, "Dual AU (common 0x12)", PHY_DUAL_PRESET, meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST, 0,
++     meshtastic_Config_LoRaConfig_RegionCode_ANZ, 916.575f, 62.5f, 7, 7, kDefaultMeshCoreSyncWord,
++     kDefaultMeshCorePreamble, true, 22},
++};
++
++PhyProfile gActiveProfile = kPresets[0];
++RadioInterface *gRadio = nullptr;
++std::function<void()> gOnChanged = nullptr;
++bool gApplyingProfile = false;
++
++bool isValidExplicitPhy(float freq_mhz, float bw_khz, uint8_t sf, uint8_t cr, uint16_t preamble)
++{
++    if (freq_mhz < 150.0f || freq_mhz > 960.0f) {
++        return false;
++    }
++    if (bw_khz < 7.8f || bw_khz > 500.0f) {
++        return false;
++    }
++    if (sf < LORA_SF_MIN || sf > LORA_SF_MAX) {
++        return false;
++    }
++    if (cr < LORA_CR_MIN || cr > LORA_CR_MAX) {
++        return false;
++    }
++    if (preamble < 4 || preamble > 256) {
++        return false;
++    }
++    return true;
++}
++
++void saveActiveProfileToNvs()
++{
++    SavedPhyRecord rec = {};
++    rec.version = kSavedPhyVersion;
++    rec.id = gActiveProfile.id;
++    rec.kind = static_cast<uint8_t>(gActiveProfile.kind);
++    rec.msh_modem_preset = gActiveProfile.msh_modem_preset;
++    rec.msh_channel_num = gActiveProfile.msh_channel_num;
++    rec.msh_region = gActiveProfile.msh_region;
++    rec.freq_mhz = gActiveProfile.freq_mhz;
++    rec.bw_khz = gActiveProfile.bw_khz;
++    rec.sf = gActiveProfile.sf;
++    rec.cr = gActiveProfile.cr;
++    rec.sync_word = gActiveProfile.sync_word;
++    rec.preamble = gActiveProfile.preamble;
++    rec.crc = gActiveProfile.crc ? 1 : 0;
++    rec.tx_power = gActiveProfile.tx_power;
++
++    Preferences prefs;
++    if (prefs.begin("raumata", false)) {
++        prefs.putBytes("phy", &rec, sizeof(rec));
++        prefs.end();
++    }
++}
++
++bool loadProfileFromNvs(PhyProfile &out)
++{
++    Preferences prefs;
++    if (!prefs.begin("raumata", true)) {
++        return false;
++    }
++
++    size_t len = prefs.getBytesLength("phy");
++    if (len != sizeof(SavedPhyRecord)) {
++        prefs.end();
++        return false;
++    }
++
++    SavedPhyRecord rec = {};
++    bool ok = prefs.getBytes("phy", &rec, sizeof(rec)) == sizeof(rec);
++    prefs.end();
++    if (!ok || rec.version != kSavedPhyVersion) {
++        return false;
++    }
++
++    const PhyProfile *preset = findPhyPreset(rec.id);
++    if (preset && rec.id != kPhyProfileCustomId) {
++        out = *preset;
++        if (rec.tx_power != 0) {
++            out.tx_power = rec.tx_power;
++        }
++        return true;
++    }
++
++    out.id = kPhyProfileCustomId;
++    out.name = "Custom";
++    out.kind = static_cast<PhyProfileKind>(rec.kind);
++    out.msh_modem_preset = rec.msh_modem_preset;
++    out.msh_channel_num = rec.msh_channel_num;
++    out.msh_region = rec.msh_region;
++    out.freq_mhz = rec.freq_mhz;
++    out.bw_khz = rec.bw_khz;
++    out.sf = rec.sf;
++    out.cr = rec.cr;
++    out.sync_word = rec.sync_word ? rec.sync_word : kDefaultMeshtasticSyncWord;
++    out.preamble = rec.preamble ? rec.preamble : kDefaultMeshtasticPreamble;
++    out.crc = rec.crc != 0;
++    out.tx_power = rec.tx_power ? rec.tx_power : 22;
++    return true;
++}
++
++PhyProfile deriveProfileFromMeshtasticConfig(uint8_t fallbackSync, uint16_t fallbackPreamble)
++{
++    if (config.lora.use_preset && config.lora.override_frequency == 0.0f) {
++        for (const auto &preset : kPresets) {
++            if (preset.kind == PHY_MESHTASTIC_PRESET &&
++                preset.msh_modem_preset == static_cast<uint8_t>(config.lora.modem_preset) &&
++                (preset.msh_region == static_cast<uint8_t>(config.lora.region) ||
++                 config.lora.region == meshtastic_Config_LoRaConfig_RegionCode_UNSET)) {
++                PhyProfile matched = preset;
++                matched.msh_channel_num = static_cast<uint16_t>(config.lora.channel_num);
++                if (config.lora.tx_power != 0) {
++                    matched.tx_power = config.lora.tx_power;
++                }
++                return matched;
++            }
++        }
++
++        float bw = LORA_BW_DEFAULT_KHZ;
++        uint8_t sf = LORA_SF_DEFAULT;
++        uint8_t cr = LORA_CR_DEFAULT;
++        modemPresetToParams(config.lora.modem_preset, false, bw, sf, cr);
++
++        PhyProfile msh = {};
++        msh.id = 1;
++        msh.name = "Meshtastic Preset";
++        msh.kind = PHY_MESHTASTIC_PRESET;
++        msh.msh_modem_preset = static_cast<uint8_t>(config.lora.modem_preset);
++        msh.msh_channel_num = static_cast<uint16_t>(config.lora.channel_num);
++        msh.msh_region = static_cast<uint8_t>(config.lora.region);
++        msh.freq_mhz = 0.0f;
++        msh.bw_khz = bw;
++        msh.sf = sf;
++        msh.cr = cr;
++        msh.sync_word = kDefaultMeshtasticSyncWord;
++        msh.preamble = kDefaultMeshtasticPreamble;
++        msh.crc = true;
++        msh.tx_power = config.lora.tx_power ? config.lora.tx_power : 22;
++        return msh;
++    }
++
++    PhyProfile custom = {};
++    custom.id = kPhyProfileCustomId;
++    custom.name = "Custom";
++    custom.kind = PHY_CUSTOM;
++    custom.msh_modem_preset = static_cast<uint8_t>(config.lora.modem_preset);
++    custom.msh_channel_num = static_cast<uint16_t>(config.lora.channel_num);
++    custom.msh_region = static_cast<uint8_t>(config.lora.region);
++    custom.freq_mhz = config.lora.override_frequency;
++    custom.bw_khz = clampBandwidthKHz(bwCodeToKHz(config.lora.bandwidth));
++    custom.sf = clampSpreadFactor(config.lora.spread_factor);
++    custom.cr = clampCodingRate(config.lora.coding_rate);
++    custom.sync_word = fallbackSync;
++    custom.preamble = fallbackPreamble;
++    custom.crc = true;
++    custom.tx_power = config.lora.tx_power ? config.lora.tx_power : 22;
++    return custom;
++}
++
++void writeProfileIntoLoRaConfig(const PhyProfile &profile)
++{
++    if (profile.kind == PHY_MESHTASTIC_PRESET) {
++        config.lora.use_preset = true;
++        config.lora.modem_preset = static_cast<meshtastic_Config_LoRaConfig_ModemPreset>(profile.msh_modem_preset);
++        config.lora.channel_num = profile.msh_channel_num;
++        config.lora.override_frequency = 0.0f;
++        if (config.lora.region == meshtastic_Config_LoRaConfig_RegionCode_UNSET && profile.msh_region != 0) {
++            config.lora.region = static_cast<meshtastic_Config_LoRaConfig_RegionCode>(profile.msh_region);
++            initRegion();
++        }
++        RadioInterface::bootstrapLoRaConfigFromPreset(config.lora);
++    } else {
++        config.lora.use_preset = false;
++        config.lora.bandwidth = bwKHzToCode(profile.bw_khz);
++        config.lora.spread_factor = profile.sf;
++        config.lora.coding_rate = profile.cr;
++        config.lora.override_frequency = profile.freq_mhz;
++        config.lora.channel_num = 0;
++        if (config.lora.region == meshtastic_Config_LoRaConfig_RegionCode_UNSET && profile.msh_region != 0) {
++            config.lora.region = static_cast<meshtastic_Config_LoRaConfig_RegionCode>(profile.msh_region);
++            initRegion();
++        }
++    }
++
++    if (profile.tx_power != 0) {
++        config.lora.tx_power = profile.tx_power;
++    }
++}
++
++bool commitActiveProfileToHardware()
++{
++    gApplyingProfile = true;
++    writeProfileIntoLoRaConfig(gActiveProfile);
++
++    if (gRadio) {
++        gRadio->setSyncWord(gActiveProfile.sync_word);
++        gRadio->setPreambleLength(gActiveProfile.preamble);
++        gRadio->reconfigure();
++    }
++
++    if (nodeDB) {
++        nodeDB->saveToDisk(SEGMENT_CONFIG);
++    }
++    saveActiveProfileToNvs();
++    gApplyingProfile = false;
++
++    if (gOnChanged) {
++        gOnChanged();
++    }
++    return true;
++}
++
++const char *kindName(PhyProfileKind kind)
++{
++    switch (kind) {
++    case PHY_MESHTASTIC_PRESET:
++        return "meshtastic";
++    case PHY_MESHCORE_PRESET:
++        return "meshcore";
++    case PHY_DUAL_PRESET:
++        return "dual";
++    case PHY_CUSTOM:
++    default:
++        return "custom";
++    }
++}
++
++} // namespace
++
++const PhyProfile *getPhyPresetTable(size_t &count)
++{
++    count = sizeof(kPresets) / sizeof(kPresets[0]);
++    return kPresets;
++}
++
++const PhyProfile *findPhyPreset(uint8_t id)
++{
++    for (const auto &preset : kPresets) {
++        if (preset.id == id) {
++            return &preset;
++        }
++    }
++    return nullptr;
++}
++
++const PhyProfile &activePhyProfile()
++{
++    return gActiveProfile;
++}
++
++uint8_t activeSyncWord()
++{
++    return gActiveProfile.sync_word ? gActiveProfile.sync_word : kDefaultMeshtasticSyncWord;
++}
++
++uint16_t activePreambleLength()
++{
++    return gActiveProfile.preamble ? gActiveProfile.preamble : kDefaultMeshtasticPreamble;
++}
++
++bool isApplyingPhyProfile()
++{
++    return gApplyingProfile;
++}
++
++void phyInit()
++{
++    PhyProfile loaded = {};
++    if (loadProfileFromNvs(loaded)) {
++        gActiveProfile = loaded;
++        gApplyingProfile = true;
++        writeProfileIntoLoRaConfig(gActiveProfile);
++        gApplyingProfile = false;
++    } else {
++        gActiveProfile = deriveProfileFromMeshtasticConfig(kDefaultMeshtasticSyncWord, kDefaultMeshtasticPreamble);
++        saveActiveProfileToNvs();
++    }
++}
++
++void bindPhyRadio(RadioInterface *radio, std::function<void()> onProfileChanged)
++{
++    gRadio = radio;
++    gOnChanged = std::move(onProfileChanged);
++    if (gRadio) {
++        gRadio->setSyncWord(activeSyncWord());
++        gRadio->setPreambleLength(activePreambleLength());
++    }
++}
++
++bool applyPhyProfile(uint8_t id)
++{
++    const PhyProfile *preset = findPhyPreset(id);
++    if (!preset) {
++        return false;
++    }
++
++    gActiveProfile = *preset;
++    return commitActiveProfileToHardware();
++}
++
++bool applyCustomPhyProfile(float freq_mhz, float bw_khz, uint8_t sf, uint8_t cr, uint8_t sync_word,
++                           uint16_t preamble, int8_t tx_power)
++{
++    if (!isValidExplicitPhy(freq_mhz, bw_khz, sf, cr, preamble) || sync_word == 0) {
++        return false;
++    }
++
++    gActiveProfile.id = kPhyProfileCustomId;
++    gActiveProfile.name = "Custom";
++    gActiveProfile.kind = PHY_CUSTOM;
++    gActiveProfile.msh_modem_preset = static_cast<uint8_t>(config.lora.modem_preset);
++    gActiveProfile.msh_channel_num = 0;
++    gActiveProfile.msh_region = static_cast<uint8_t>(config.lora.region);
++    gActiveProfile.freq_mhz = freq_mhz;
++    gActiveProfile.bw_khz = bw_khz;
++    gActiveProfile.sf = sf;
++    gActiveProfile.cr = cr;
++    gActiveProfile.sync_word = sync_word;
++    gActiveProfile.preamble = preamble;
++    gActiveProfile.crc = true;
++    gActiveProfile.tx_power = tx_power != 0 ? tx_power : gActiveProfile.tx_power;
++
++    return commitActiveProfileToHardware();
++}
++
++bool applyTxPower(int8_t tx_power)
++{
++    if (tx_power < -9 || tx_power > 30) {
++        return false;
++    }
++    gActiveProfile.tx_power = tx_power;
++    return commitActiveProfileToHardware();
++}
++
++void onMeshtasticConfigChanged()
++{
++    if (gApplyingProfile) {
++        return;
++    }
++
++    gActiveProfile = deriveProfileFromMeshtasticConfig(activeSyncWord(), activePreambleLength());
++    if (gRadio) {
++        gRadio->setSyncWord(activeSyncWord());
++        gRadio->setPreambleLength(activePreambleLength());
++    }
++    saveActiveProfileToNvs();
++    if (gOnChanged) {
++        gOnChanged();
++    }
++}
++
++bool handlePhyCliCommand(const char *command, char *reply, size_t replySize)
++{
++    if (!command || !reply || replySize == 0) {
++        return false;
++    }
++    if (strncmp(command, "phy", 3) != 0 || (command[3] != '\0' && command[3] != ' ')) {
++        return false;
++    }
++
++    const char *args = command + 3;
++    while (*args == ' ') {
++        args++;
++    }
++
++    if (*args == '\0' || strcmp(args, "get") == 0) {
++        float effFreq = gRadio ? gRadio->getFreq() : gActiveProfile.freq_mhz;
++        float effBw = gRadio ? gRadio->getBandwidthKHz() : gActiveProfile.bw_khz;
++        uint8_t effSf = gRadio ? gRadio->getSpreadFactorValue() : gActiveProfile.sf;
++        uint8_t effCr = gRadio ? gRadio->getCodingRateValue() : gActiveProfile.cr;
++        snprintf(reply, replySize, "phy id=%u (%s, %s) %.3fMHz BW%.1f SF%u CR%u sync=0x%02X pre=%u pwr=%ddBm",
++                 gActiveProfile.id, gActiveProfile.name, kindName(gActiveProfile.kind), effFreq, effBw, effSf, effCr,
++                 activeSyncWord(), activePreambleLength(), gRadio ? gRadio->getTxPower() : gActiveProfile.tx_power);
++        return true;
++    }
++
++    if (strcmp(args, "list") == 0) {
++        size_t count = 0;
++        const PhyProfile *table = getPhyPresetTable(count);
++        size_t pos = 0;
++        for (size_t i = 0; i < count && pos < replySize - 1; i++) {
++            int written = snprintf(reply + pos, replySize - pos, "%s%u:%s(0x%02X)", i == 0 ? "" : ", ", table[i].id,
++                                   table[i].name, table[i].sync_word);
++            if (written < 0) {
++                break;
++            }
++            pos += static_cast<size_t>(written);
++        }
++        return true;
++    }
++
++    if (strncmp(args, "set ", 4) == 0) {
++        const char *sub = args + 4;
++        while (*sub == ' ') {
++            sub++;
++        }
++        if (strncmp(sub, "custom ", 7) == 0) {
++            float freq = 0.0f;
++            float bw = 0.0f;
++            unsigned int sf = 0;
++            unsigned int cr = 0;
++            unsigned int sync = activeSyncWord();
++            unsigned int preamble = activePreambleLength();
++            int parsed = sscanf(sub + 7, "%f %f %u %u %x %u", &freq, &bw, &sf, &cr, &sync, &preamble);
++            if (parsed >= 4 &&
++                applyCustomPhyProfile(freq, bw, static_cast<uint8_t>(sf), static_cast<uint8_t>(cr),
++                                      static_cast<uint8_t>(sync), static_cast<uint16_t>(preamble),
++                                      gActiveProfile.tx_power)) {
++                snprintf(reply, replySize, "ok: custom %.3fMHz BW%.1f SF%u CR%u sync=0x%02X pre=%u", freq, bw, sf, cr,
++                         sync, preamble);
++            } else {
++                snprintf(reply, replySize, "err: usage phy set custom <freq_mhz> <bw_khz> <sf> <cr> [sync_hex] [pre]");
++            }
++            return true;
++        }
++
++        unsigned int id = static_cast<unsigned int>(strtoul(sub, nullptr, 10));
++        if (applyPhyProfile(static_cast<uint8_t>(id))) {
++            snprintf(reply, replySize, "ok: phy %u (%s) sync=0x%02X pre=%u", gActiveProfile.id, gActiveProfile.name,
++                     activeSyncWord(), activePreambleLength());
++        } else {
++            snprintf(reply, replySize, "err: unknown phy preset %u", id);
++        }
++        return true;
++    }
++
++    snprintf(reply, replySize, "err: usage phy [get|list|set <id>|set custom ...]");
++    return true;
++}
++
++} // namespace raumata
++
++#endif // RAUMATA_DUAL_PROTOCOL
+diff --git a/src/raumata/PhyProfile.h b/src/raumata/PhyProfile.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..80c7f6d1f3f7b9448c918791b707575bcd6bc6a4
+--- /dev/null
++++ b/src/raumata/PhyProfile.h
+@@ -0,0 +1,83 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++
++#include "mesh/RadioInterface.h"
++
++namespace raumata {
++
++enum PhyProfileKind : uint8_t {
++    PHY_MESHTASTIC_PRESET = 0,
++    PHY_MESHCORE_PRESET = 1,
++    PHY_DUAL_PRESET = 2,
++    PHY_CUSTOM = 3,
++};
++
++constexpr uint8_t kPhyProfileCustomId = 255;
++constexpr uint8_t kDefaultMeshtasticSyncWord = 0x2B;
++constexpr uint8_t kDefaultMeshCoreSyncWord = 0x12;
++constexpr uint16_t kDefaultMeshtasticPreamble = 16;
++constexpr uint16_t kDefaultMeshCorePreamble = 32;
++
++struct PhyProfile {
++    uint8_t id;
++    const char *name;
++    PhyProfileKind kind;
++
++    // Meshtastic-preset fields
++    uint8_t msh_modem_preset;
++    uint16_t msh_channel_num;
++    uint8_t msh_region;
++
++    // Explicit PHY fields (MeshCore, dual, custom)
++    float freq_mhz;
++    float bw_khz;
++    uint8_t sf;
++    uint8_t cr;
++    uint8_t sync_word;
++    uint16_t preamble;
++    bool crc;
++    int8_t tx_power;
++};
++
++/// Return the static table of built-in PHY presets.
++const PhyProfile *getPhyPresetTable(size_t &count);
++
++/// Look up a built-in PHY preset by ID.
++const PhyProfile *findPhyPreset(uint8_t id);
++
++/// Return the currently active PHY profile.
++const PhyProfile &activePhyProfile();
++
++/// Effective sync word and preamble length for the active profile.
++uint8_t activeSyncWord();
++uint16_t activePreambleLength();
++
++/// True while applyPhyProfile/applyCustomPhyProfile is mutating config.lora.
++bool isApplyingPhyProfile();
++
++/// Load the saved PHY profile from NVS and apply it to config.lora before initLoRa().
++void phyInit();
++
++/// Bind the initialized RadioInterface and an optional callback invoked after runtime profile changes.
++void bindPhyRadio(RadioInterface *radio, std::function<void()> onProfileChanged = nullptr);
++
++/// Select and apply a built-in preset by ID at runtime.
++bool applyPhyProfile(uint8_t id);
++
++/// Apply a custom PHY configuration at runtime.
++bool applyCustomPhyProfile(float freq_mhz, float bw_khz, uint8_t sf, uint8_t cr, uint8_t sync_word,
++                           uint16_t preamble, int8_t tx_power);
++
++/// Update TX power on the active PHY profile and reconfigure the radio.
++bool applyTxPower(int8_t tx_power);
++
++/// Synchronize the active PHY profile when the Meshtastic app modifies config.lora.
++void onMeshtasticConfigChanged();
++
++/// Execute a "phy ..." CLI command and write a human-readable response into reply.
++bool handlePhyCliCommand(const char *command, char *reply, size_t replySize);
++
++} // namespace raumata
+diff --git a/src/raumata/RaumataProtocol.cpp b/src/raumata/RaumataProtocol.cpp
+index 8c2aa4ababea9a1c9a1bdb3e50ea5fef3e8cceb0..49ec739aeeabe9d73450f0efde5b2c98052f58b2 100644
+--- a/src/raumata/RaumataProtocol.cpp
++++ b/src/raumata/RaumataProtocol.cpp
+@@ -16,6 +16,7 @@
+ #include "CompanionSerial.h"
+ #include "MeshCoreNode.h"
+ #include "MeshCoreRadio.h"
++#include "PhyProfile.h"
+ #include "SerialConsole.h"
+ #include "gps/RTC.h"
+ 
+@@ -83,6 +84,8 @@ void init(RadioInterface *radio)
+         return;
+     }
+ 
++    bindPhyRadio(radio);
++
+     gManager = new StaticPoolPacketManager(16);
+     gRadio = new MeshCoreRadio(*radio);
+     gNode = new MeshCoreNode(*gRadio, gClock, gRng, gRtc, *gManager, gTables, *radio, writeFrame);
+diff --git a/src/raumata/RaumataProtocol.h b/src/raumata/RaumataProtocol.h
+index 403320e1807aca1a464b023b6ccd4a8c085dbbe0..ad825f650978558f81e01ca4443faea34d823ca9 100644
+--- a/src/raumata/RaumataProtocol.h
++++ b/src/raumata/RaumataProtocol.h
+@@ -4,6 +4,9 @@
+ 
+ namespace raumata {
+ 
++/// Load the persisted shared PHY profile and configure config.lora before initLoRa().
++void phyInit();
++
+ /// Start the MeshCore side of the dual-protocol stack.  Safe to call once,
+ /// after the Meshtastic radio has been initialized.
+ void init(RadioInterface *radio);

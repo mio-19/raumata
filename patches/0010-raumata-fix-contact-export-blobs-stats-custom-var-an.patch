@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mio <mio@mio19.uk>
+Date: Fri, 23 Oct 2026 11:47:07 +1100
+Subject: [PATCH] raumata: fix contact export blobs, stats, custom var and
+ header includes
+
+
+diff --git a/src/raumata/CompanionProtocol.h b/src/raumata/CompanionProtocol.h
+index 1572eb49526409f26c6ef79da2396d8e42a64499..5c6f1b3f08180c9c6d0a12cab17b42af45a5e612 100644
+--- a/src/raumata/CompanionProtocol.h
++++ b/src/raumata/CompanionProtocol.h
+@@ -86,7 +86,13 @@ constexpr uint8_t RAUMATA_TXT_TYPE_PLAIN = 0;
+ constexpr uint8_t FIRMWARE_VER_CODE = 14;
+ constexpr const char *FIRMWARE_VERSION = "raumata-0.2";
+ constexpr const char *FIRMWARE_BUILD_DATE = "23 Oct 2026";
++#if defined(T_DECK)
++constexpr const char *MANUFACTURER_NAME = "Raumata T-Deck";
++#elif defined(HELTEC_V3)
++constexpr const char *MANUFACTURER_NAME = "Raumata Heltec V3";
++#else
+ constexpr const char *MANUFACTURER_NAME = "Raumata";
++#endif
+ 
+ #define RAUMATA_PUBLIC_GROUP_PSK "izOH6cXN6mrJ5e26oRXNcg=="
+ 
+diff --git a/src/raumata/MeshCoreNode.cpp b/src/raumata/MeshCoreNode.cpp
+index fec72aac0a2ae547e67ed0109be6b3ad292498bd..de01d3c6b7d97ee0fd113e9758f9edfa94db2819 100644
+--- a/src/raumata/MeshCoreNode.cpp
++++ b/src/raumata/MeshCoreNode.cpp
+@@ -490,6 +490,52 @@ void MeshCoreNode::onContactResponse(const ContactInfo &contact, const uint8_t *
+     (void)len;
+ }
+ 
++int MeshCoreNode::getBlobByKey(const uint8_t key[], int keyLen, uint8_t destBuf[])
++{
++    if (keyLen <= 0 || keyLen > PUB_KEY_SIZE) {
++        return 0;
++    }
++    for (size_t i = 0; i < MAX_CONTACTS; ++i) {
++        if (contactBlobs_[i].active && memcmp(contactBlobs_[i].key, key, keyLen) == 0) {
++            memcpy(destBuf, contactBlobs_[i].data, contactBlobs_[i].len);
++            return contactBlobs_[i].len;
++        }
++    }
++    return 0;
++}
++
++bool MeshCoreNode::putBlobByKey(const uint8_t key[], int keyLen, const uint8_t srcBuf[], int len)
++{
++    if (keyLen <= 0 || keyLen > PUB_KEY_SIZE || len <= 0 || len > MAX_TRANS_UNIT) {
++        return false;
++    }
++    for (size_t i = 0; i < MAX_CONTACTS; ++i) {
++        if (contactBlobs_[i].active && memcmp(contactBlobs_[i].key, key, keyLen) == 0) {
++            memcpy(contactBlobs_[i].data, srcBuf, len);
++            contactBlobs_[i].len = static_cast<uint8_t>(len);
++            return true;
++        }
++    }
++    for (size_t i = 0; i < MAX_CONTACTS; ++i) {
++        if (!contactBlobs_[i].active) {
++            memset(contactBlobs_[i].key, 0, PUB_KEY_SIZE);
++            memcpy(contactBlobs_[i].key, key, keyLen);
++            memcpy(contactBlobs_[i].data, srcBuf, len);
++            contactBlobs_[i].len = static_cast<uint8_t>(len);
++            contactBlobs_[i].active = true;
++            return true;
++        }
++    }
++    size_t idx = nextBlobIdx_ % MAX_CONTACTS;
++    nextBlobIdx_ = static_cast<uint8_t>((idx + 1) % MAX_CONTACTS);
++    memset(contactBlobs_[idx].key, 0, PUB_KEY_SIZE);
++    memcpy(contactBlobs_[idx].key, key, keyLen);
++    memcpy(contactBlobs_[idx].data, srcBuf, len);
++    contactBlobs_[idx].len = static_cast<uint8_t>(len);
++    contactBlobs_[idx].active = true;
++    return true;
++}
++
+ void MeshCoreNode::writeOK()
+ {
+     uint8_t frame = RESP_CODE_OK;
+@@ -709,7 +755,7 @@ void MeshCoreNode::writeStats(uint8_t statsType)
+     case STATS_TYPE_CORE: {
+         uint16_t battMv = powerStatus ? static_cast<uint16_t>(powerStatus->getBatteryVoltageMv()) : 0;
+         uint32_t uptimeSec = millis() / 1000;
+-        uint16_t errFlags = getErrFlags();
++        uint16_t errFlags = _err_flags;
+         uint8_t queueLen = static_cast<uint8_t>((msgHead_ + kMessageQueueSize - msgTail_) % kMessageQueueSize);
+         memcpy(&frame[i], &battMv, 2);
+         i += 2;
+@@ -922,7 +968,7 @@ void MeshCoreNode::handleCommand(uint8_t command, const uint8_t *frame, size_t l
+         break;
+ 
+     case CMD_ADD_UPDATE_CONTACT:
+-        if (len >= 1 + PUB_KEY_SIZE + 1 + 1 + 1 + MAX_PATH_SIZE + 32 + 4) {
++        if (len >= 1 + PUB_KEY_SIZE + 1 + 1 + 1 + MAX_PATH_SIZE + 32) {
+             ContactInfo contact = {};
+             int i = 1;
+             memcpy(contact.id.pub_key, &frame[i], PUB_KEY_SIZE);
+@@ -934,8 +980,10 @@ void MeshCoreNode::handleCommand(uint8_t command, const uint8_t *frame, size_t l
+             i += MAX_PATH_SIZE;
+             StrHelper::strzcpy(contact.name, reinterpret_cast<const char *>(&frame[i]), 32);
+             i += 32;
+-            memcpy(&contact.last_advert_timestamp, &frame[i], 4);
+-            i += 4;
++            if (len >= static_cast<size_t>(i + 4)) {
++                memcpy(&contact.last_advert_timestamp, &frame[i], 4);
++                i += 4;
++            }
+             if (len >= static_cast<size_t>(i + 8)) {
+                 memcpy(&contact.gps_lat, &frame[i], 4);
+                 i += 4;
+@@ -1168,7 +1216,7 @@ void MeshCoreNode::handleCommand(uint8_t command, const uint8_t *frame, size_t l
+             *colon = 0;
+             const char *key = kv;
+             const char *val = colon + 1;
+-            if (strcmp(key, "phy.id") == 0) {
++            if (strcmp(key, "phy.id") == 0 || strcmp(key, "phy_profile") == 0) {
+                 uint8_t id = static_cast<uint8_t>(strtoul(val, nullptr, 10));
+                 if (applyPhyProfile(id)) {
+                     writeOK();
+diff --git a/src/raumata/MeshCoreNode.h b/src/raumata/MeshCoreNode.h
+index 36723d5e6b1acd1d68a4bd6d4d344776a391a598..92331cbbb6d9dcb7e03f50e3961d8a164fa6e3ad 100644
+--- a/src/raumata/MeshCoreNode.h
++++ b/src/raumata/MeshCoreNode.h
+@@ -52,6 +52,8 @@ class MeshCoreNode : public BaseChatMesh
+     uint8_t onContactRequest(const ContactInfo &contact, uint32_t senderTimestamp, const uint8_t *data, uint8_t len,
+                              uint8_t *reply) override;
+     void onContactResponse(const ContactInfo &contact, const uint8_t *data, uint8_t len) override;
++    int getBlobByKey(const uint8_t key[], int keyLen, uint8_t destBuf[]) override;
++    bool putBlobByKey(const uint8_t key[], int keyLen, const uint8_t srcBuf[], int len) override;
+ 
+   private:
+     static constexpr uint8_t kMessageQueueSize = 8;
+@@ -77,6 +79,13 @@ class MeshCoreNode : public BaseChatMesh
+         bool active;
+     };
+ 
++    struct ContactBlob {
++        uint8_t key[PUB_KEY_SIZE];
++        uint8_t data[MAX_TRANS_UNIT];
++        uint8_t len;
++        bool active;
++    };
++
+     RadioInterface &meshtasticRadio_;
+     FrameWriter writer_;
+     char nodeName_[32];
+@@ -85,6 +94,8 @@ class MeshCoreNode : public BaseChatMesh
+     uint8_t msgHead_ = 0;
+     uint8_t msgTail_ = 0;
+     PendingAck pendingAcks_[kPendingAckSize] = {};
++    ContactBlob contactBlobs_[MAX_CONTACTS] = {};
++    uint8_t nextBlobIdx_ = 0;
+     uint8_t nextAckSlot_ = 0;
+     uint32_t lastAdvertMs_ = 0;
+ 
+diff --git a/src/raumata/PresenceScheduler.cpp b/src/raumata/PresenceScheduler.cpp
+index 8c393a500a2aa16f0d776a86931ed32f6a073a55..a98ee1fc0ef278b2bf4afb84371a4f3ee76a2727 100644
+--- a/src/raumata/PresenceScheduler.cpp
++++ b/src/raumata/PresenceScheduler.cpp
+@@ -6,6 +6,7 @@
+ #include "MeshCoreNode.h"
+ #include "airtime.h"
+ #include "mesh/MeshRadio.h"
++#include "mesh/NodeDB.h"
+ #include "modules/NodeInfoModule.h"
+ 
+ namespace raumata {

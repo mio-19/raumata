@@ -1,0 +1,207 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mio <mio@mio19.uk>
+Date: Fri, 23 Oct 2026 11:35:30 +1100
+Subject: [PATCH] meshcore: fix USB scan flow, contact prefix hex, and
+ self-info UI
+
+
+diff --git a/feature/meshcore/src/androidMain/kotlin/org/meshtastic/feature/meshcore/UsbMeshCoreAdapter.kt b/feature/meshcore/src/androidMain/kotlin/org/meshtastic/feature/meshcore/UsbMeshCoreAdapter.kt
+index dcd4133971109123291cd24b6dfc6b2bf558a2d8..a5a11468f588141a2da38ba352fae53f0ab09ef6 100644
+--- a/feature/meshcore/src/androidMain/kotlin/org/meshtastic/feature/meshcore/UsbMeshCoreAdapter.kt
++++ b/feature/meshcore/src/androidMain/kotlin/org/meshtastic/feature/meshcore/UsbMeshCoreAdapter.kt
+@@ -20,9 +20,10 @@ import com.darkrockstudios.libs.meshcore.ble.BleAdapter
+ import com.darkrockstudios.libs.meshcore.ble.BleConnection
+ import com.darkrockstudios.libs.meshcore.ble.DiscoveredDevice
+ import com.darkrockstudios.libs.meshcore.ble.ScanFilter
++import kotlinx.coroutines.ExperimentalCoroutinesApi
+ import kotlinx.coroutines.flow.Flow
+ import kotlinx.coroutines.flow.firstOrNull
+-import kotlinx.coroutines.flow.map
++import kotlinx.coroutines.flow.transformLatest
+ import kotlinx.coroutines.withTimeoutOrNull
+ import org.meshtastic.core.network.repository.UsbRepository
+ import kotlin.time.Duration.Companion.seconds
+@@ -34,15 +35,16 @@ import kotlin.time.Duration.Companion.seconds
+  * BLE interface passes one command per characteristic write. [UsbMeshCoreConnection]
+  * bridges that difference.
+  */
++@OptIn(ExperimentalCoroutinesApi::class)
+ class UsbMeshCoreAdapter(
+     private val usbRepository: UsbRepository,
+ ) : BleAdapter {
+     override val isBluetoothEnabled: Boolean = usbRepository.isSupported
+ 
+     override fun scan(filter: ScanFilter): Flow<DiscoveredDevice> =
+-        usbRepository.serialDevices.map { drivers ->
+-            drivers.map { (id, driver) ->
+-                DiscoveredDevice(identifier = id, name = driver.device.deviceName, rssi = 0)
++        usbRepository.serialDevices.transformLatest { drivers ->
++            for ((id, driver) in drivers) {
++                emit(DiscoveredDevice(identifier = id, name = driver.device.deviceName, rssi = 0))
+             }
+         }
+ 
+diff --git a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreRepository.kt b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreRepository.kt
+index 2f1a9706c93167036627468fc033748da9a36409..1bedcbd6a911309b50d8724ef8ef61e3ed4dc147 100644
+--- a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreRepository.kt
++++ b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreRepository.kt
+@@ -45,6 +45,8 @@ import org.meshtastic.core.di.CoroutineDispatchers
+ import org.meshtastic.feature.meshcore.model.MeshCoreChatMessage
+ import org.meshtastic.feature.meshcore.model.MeshCoreDevice
+ import org.meshtastic.feature.meshcore.model.MeshCoreTransport
++import org.meshtastic.feature.meshcore.model.publicKeyPrefixHex
++import org.meshtastic.feature.meshcore.model.toPrefixHex
+ 
+ /**
+  * Owns the MeshCore companion connection independently of the Meshtastic radio.
+@@ -132,7 +134,7 @@ class MeshCoreRepository(
+                                 MeshCoreChatMessage(
+                                     text = message.text,
+                                     outgoing = false,
+-                                    contactPrefix = message.publicKeyPrefix,
++                                    contactPrefix = message.publicKeyPrefix.toPrefixHex(),
+                                     timestamp = message.timestamp,
+                                 )
+                         }
+@@ -220,6 +222,25 @@ class MeshCoreRepository(
+             .onFailure { _error.value = it.message ?: "Could not send MeshCore message" }
+     }
+ 
++    suspend fun sendSelfAdvert(flood: Boolean = true) {
++        val conn = connection.value ?: return
++        runCatching { conn.sendSelfAdvert(flood = flood) }
++            .onFailure { _error.value = it.message ?: "Could not send MeshCore advert" }
++    }
++
++    suspend fun refresh() {
++        val conn = connection.value ?: return
++        runCatching {
++                conn.refreshChannels()
++                conn.refreshContacts()
++            }
++            .onFailure { _error.value = it.message ?: "Could not refresh MeshCore state" }
++    }
++
++    fun clearError() {
++        _error.value = null
++    }
++
+     private companion object {
+         const val MAX_MESSAGES = 200
+     }
+diff --git a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreViewModel.kt b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreViewModel.kt
+index bf114df965f26703a287e24dcf081577533024af..6ce2ab192b36e6f10567d89ec0216f8e549d6f18 100644
+--- a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreViewModel.kt
++++ b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreViewModel.kt
+@@ -88,4 +88,14 @@ class MeshCoreViewModel(private val repository: MeshCoreRepository) : ViewModel(
+             }
+         }
+     }
++
++    fun sendSelfAdvert(flood: Boolean = true) {
++        viewModelScope.launch { repository.sendSelfAdvert(flood) }
++    }
++
++    fun refresh() {
++        viewModelScope.launch { repository.refresh() }
++    }
++
++    fun clearError() = repository.clearError()
+ }
+diff --git a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/model/MeshCoreModels.kt b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/model/MeshCoreModels.kt
+index 07332baa2b1bba16b5544dff498378bf015d58bf..43fd0b0ee0d6967b6a3faf715a7c02644e516993 100644
+--- a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/model/MeshCoreModels.kt
++++ b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/model/MeshCoreModels.kt
+@@ -16,12 +16,23 @@
+  */
+ package org.meshtastic.feature.meshcore.model
+ 
++import com.darkrockstudios.libs.meshcore.model.Contact
++
+ /** Physical transport used to reach a MeshCore companion. */
+ enum class MeshCoreTransport {
+     USB,
+     BLE,
+ }
+ 
++/** Format a raw public-key prefix byte array as lowercase hex. */
++fun ByteArray.toPrefixHex(): String = joinToString(separator = "") { byte ->
++    val v = byte.toInt() and 0xFF
++    v.toString(16).padStart(2, '0')
++}
++
++/** Return the 6-byte public-key prefix of a MeshCore [Contact] as lowercase hex. */
++fun Contact.publicKeyPrefixHex(): String = publicKeyPrefix.toPrefixHex()
++
+ /** A MeshCore companion discovered on a transport. */
+ data class MeshCoreDevice(
+     val id: String,
+diff --git a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/ui/MeshCoreScreen.kt b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/ui/MeshCoreScreen.kt
+index b17765bc3167de4034b745461bae42a7bf74ba35..6cae267f30a7340e47be7dd063bb2fd5b7f93ab9 100644
+--- a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/ui/MeshCoreScreen.kt
++++ b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/ui/MeshCoreScreen.kt
+@@ -52,11 +52,14 @@ import androidx.compose.ui.unit.dp
+ import com.darkrockstudios.libs.meshcore.ble.ConnectionState
+ import com.darkrockstudios.libs.meshcore.model.Channel
+ import com.darkrockstudios.libs.meshcore.model.Contact
++import com.darkrockstudios.libs.meshcore.model.SelfInfo
+ import org.koin.compose.viewmodel.koinViewModel
+ import org.meshtastic.feature.meshcore.MeshCoreViewModel
+ import org.meshtastic.feature.meshcore.model.MeshCoreChatMessage
+ import org.meshtastic.feature.meshcore.model.MeshCoreDevice
+ import org.meshtastic.feature.meshcore.model.MeshCoreTransport
++import org.meshtastic.feature.meshcore.model.publicKeyPrefixHex
++import org.meshtastic.feature.meshcore.model.toPrefixHex
+ 
+ /**
+  * Dedicated MeshCore companion surface. It deliberately does not reuse the
+@@ -70,6 +73,7 @@ fun MeshCoreScreen(viewModel: MeshCoreViewModel = koinViewModel()) {
+     val devices by viewModel.devices.collectAsState()
+     val channels by viewModel.channels.collectAsState()
+     val contacts by viewModel.contacts.collectAsState()
++    val selfInfo by viewModel.selfInfo.collectAsState()
+     val messages by viewModel.messages.collectAsState()
+     val transport by viewModel.transport.collectAsState()
+     val selectedChannel by viewModel.selectedChannel.collectAsState()
+@@ -84,6 +88,8 @@ fun MeshCoreScreen(viewModel: MeshCoreViewModel = koinViewModel()) {
+                 title = { Text("MeshCore") },
+                 actions = {
+                     if (connected) {
++                        TextButton(onClick = { viewModel.sendSelfAdvert(flood = true) }) { Text("Advert") }
++                        TextButton(onClick = viewModel::refresh) { Text("Refresh") }
+                         TextButton(onClick = viewModel::disconnect) { Text("Disconnect") }
+                     }
+                 },
+@@ -91,7 +97,7 @@ fun MeshCoreScreen(viewModel: MeshCoreViewModel = koinViewModel()) {
+         },
+     ) { padding ->
+         Column(modifier = Modifier.padding(padding).fillMaxSize()) {
+-            ConnectionBanner(connectionState)
++            ConnectionBanner(connectionState, selfInfo)
+             error?.let {
+                 Text(
+                     text = it,
+@@ -145,12 +151,21 @@ fun MeshCoreScreen(viewModel: MeshCoreViewModel = koinViewModel()) {
+ }
+ 
+ @Composable
+-private fun ConnectionBanner(state: ConnectionState) {
++private fun ConnectionBanner(state: ConnectionState, selfInfo: SelfInfo?) {
+     val text =
+         when (state) {
+             ConnectionState.Disconnected -> "Not connected"
+             ConnectionState.Connecting -> "Connecting…"
+-            ConnectionState.Connected -> "Connected"
++            ConnectionState.Connected -> {
++                if (selfInfo != null) {
++                    val keyPrefix = selfInfo.publicKey.take(6).toByteArray().toPrefixHex()
++                    val freqMhz = selfInfo.radioFreqKhz / 1000.0
++                    val bwKhz = selfInfo.radioBwHz / 1000.0
++                    "${selfInfo.nodeName} ($keyPrefix) · ${freqMhz} MHz · BW ${bwKhz} kHz · SF${selfInfo.radioSf} · CR4/${selfInfo.radioCr}"
++                } else {
++                    "Connected"
++                }
++            }
+             is ConnectionState.Error -> state.message
+         }
+     Text(

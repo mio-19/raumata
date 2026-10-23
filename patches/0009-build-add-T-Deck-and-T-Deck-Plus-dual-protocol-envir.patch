@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mio <mio@mio19.uk>
+Date: Fri, 23 Oct 2026 11:47:07 +1100
+Subject: [PATCH] build: add T-Deck and T-Deck Plus dual-protocol environments
+
+
+diff --git a/docs/raumata-dual-protocol.md b/docs/raumata-dual-protocol.md
+index 01784c8d209bbaf8ad0722b2dd12fc6945ba4eb4..1ad6969dadb61285d4c0a4cbc7ba97ae88a155e0 100644
+--- a/docs/raumata-dual-protocol.md
++++ b/docs/raumata-dual-protocol.md
+@@ -84,5 +84,8 @@ debug log or `FromRadio` queue contention.
+ ## Build
+ 
+ ```sh
+-pio run -e heltec-v3-dual
++pio run -e heltec-v3-dual      # Heltec V3
++pio run -e t-deck-plus-dual    # LILYGO T-Deck Plus (BaseUI + built-in L76K GPS)
++pio run -e t-deck-dual         # LILYGO T-Deck (BaseUI)
++pio run -e t-deck-tft-dual     # LILYGO T-Deck / T-Deck Plus (MUI / LVGL)
+ ```
+diff --git a/variants/esp32s3/t-deck/platformio.ini b/variants/esp32s3/t-deck/platformio.ini
+index 6ee5a9e54a5e022f42cc345a338ab0d8930edf0f..4071435ae4f6184d708d834427947d8f4d7af98b 100644
+--- a/variants/esp32s3/t-deck/platformio.ini
++++ b/variants/esp32s3/t-deck/platformio.ini
+@@ -88,3 +88,44 @@ lib_deps =
+   ${env:t-deck.lib_deps}
+   ${device-ui_base.lib_deps}
+   ;https://github.com/bitbank2/bb_captouch/archive/refs/tags/1.3.1.zip
++
++; Raumata dual-protocol firmware for LILYGO T-Deck / T-Deck Plus:
++; Meshtastic + MeshCore on the shared SX1262.
++[env:t-deck-dual]
++extends = env:t-deck
++build_flags =
++  ${env:t-deck.build_flags}
++  -D RAUMATA_DUAL_PROTOCOL=1
++  -D RAUMATA_COMPANION_MODE_BLE_USB=1
++  -D MAX_CONTACTS=32
++  -D MAX_GROUP_CHANNELS=8
++  -I lib/meshcore/src
++  -I lib/meshcore/src/ed25519
++lib_deps =
++  ${env:t-deck.lib_deps}
++  rweather/Crypto @ ^0.4.0
++  densaugeo/base64 @ ~1.4.0
++
++; LILYGO T-Deck Plus (includes built-in L76K GPS on GPIO44/43).
++[env:t-deck-plus-dual]
++extends = env:t-deck-dual
++build_flags =
++  ${env:t-deck-dual.build_flags}
++  -U GPS_DEFAULT_NOT_PRESENT
++
++; LILYGO T-Deck / T-Deck Plus with Meshtastic UI (TFT) + Raumata dual-protocol.
++[env:t-deck-tft-dual]
++extends = env:t-deck-tft
++build_flags =
++  ${env:t-deck-tft.build_flags}
++  -U GPS_DEFAULT_NOT_PRESENT
++  -D RAUMATA_DUAL_PROTOCOL=1
++  -D RAUMATA_COMPANION_MODE_BLE_USB=1
++  -D MAX_CONTACTS=32
++  -D MAX_GROUP_CHANNELS=8
++  -I lib/meshcore/src
++  -I lib/meshcore/src/ed25519
++lib_deps =
++  ${env:t-deck-tft.lib_deps}
++  rweather/Crypto @ ^0.4.0
++  densaugeo/base64 @ ~1.4.0

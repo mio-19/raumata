@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mio <mio@mio19.uk>
+Date: Fri, 23 Oct 2026 11:13:07 +1100
+Subject: [PATCH] docs: document dual-protocol sharing and limitations
+
+Document shared PHY profiles, RAUM frame demultiplexing, radio ownership, dual identity linking, presence scheduling, and simultaneous BLE+USB companion operation.
+
+diff --git a/docs/raumata-dual-protocol.md b/docs/raumata-dual-protocol.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..01784c8d209bbaf8ad0722b2dd12fc6945ba4eb4
+--- /dev/null
++++ b/docs/raumata-dual-protocol.md
+@@ -0,0 +1,88 @@
++# Raumata dual-protocol stack
++
++This tree runs Meshtastic and MeshCore concurrently on the Heltec V3's single
++SX1262 so one radio can participate in both a Meshtastic mesh and a MeshCore
++mesh without a hardware modification.
++
++## Shared PHY profiles
++
++A LoRa receiver has one demodulator configuration at a time. Raumata keeps the
++SX1262 in **one selectable physical configuration (`PhyProfile`)** stored in NVS
++(`raumata/phy`) and shared by both stacks:
++
++- **Meshtastic presets** (`ANZ LongFast`, `ANZ MediumSlow`, `ANZ ShortFast`,
++  `US LongFast`, `EU868 LongFast`): native sync word `0x2B`, 16-symbol preamble,
++  region/channel frequency calculation.
++- **MeshCore presets** (`Australia (Narrow)` 916.575 MHz BW62.5/SF7/CR7,
++  `New Zealand (Narrow)` 917.375 MHz, `US/Canada (Narrow)` 910.525 MHz,
++  `Portugal 868` 869.618 MHz): native sync word `0x12`, 32-symbol preamble,
++  explicit frequency override.
++- **Dual presets** (`Dual AU (common 0x2B)` and `Dual AU (common 0x12)`):
++  explicit 916.575 MHz BW62.5/SF7/CR7 with a chosen common sync word.
++- **Custom (`255`)**: user-defined frequency, bandwidth, spreading factor,
++  coding rate, sync word, preamble length, and TX power.
++
++`raumata::phyInit()` loads the active profile before `initLoRa()` and drives
++both `config.lora` and `RadioInterface`'s `syncWord` and `preambleLength`.
++Runtime changes from either the Meshtastic radio configuration or the MeshCore
++companion API (`CMD_SET_RADIO_PARAMS`, `CMD_SET_RADIO_TX_POWER`,
++`CMD_SET_PHY_PROFILE`, or CLI `phy list|get|set`) reconfigure the radio once for
++both stacks and schedule a rate-limited re-advertisement.
++
++## Frame demultiplexing
++
++MeshCore frames are prepended with the four-byte transport tag `RAUM` before
++they reach the radio. Received frames beginning with the tag are stripped and
++handed to MeshCore; everything else is passed to Meshtastic unchanged. The tag
++is transport-level only, so MeshCore's packet format and cryptography are
++unmodified.
++
++## Radio ownership and shared airtime
++
++`RadioLibInterface` exposes a raw-frame sink and a raw transmit path:
++
++- **RX**: the sink runs after `readData()` and before Meshtastic header parsing.
++  MeshCore frames are queued for `MeshCoreRadio::recvRaw()`.
++- **TX & CAD**: MeshCore and Meshtastic serialize access with `rawRadioMutex`
++  and `sendingPacket`/`rawTxActive`/`isChannelBusy()`. `MeshCoreRadio` reports
++  channel busy whenever Meshtastic is transmitting or actively receiving a LoRa
++  frame, preventing TX-over-RX collisions.
++- **Airtime budget**: raw MeshCore transmissions are logged to Meshtastic's
++  `AirTime` tracker (`TX_LOG`), and `PresenceScheduler` scales the MeshCore
++  `Dispatcher` airtime budget factor to 25% of the regional duty cycle.
++
++## Dual identity, presence, and node features
++
++`src/raumata/MeshCoreNode.*`, `IdentityLink.*`, and `PresenceScheduler.*`
++implement a full `BaseChatMesh` companion node:
++
++- **Identity & Link Record**: Ed25519 keypair persisted in NVS (`raumata/mc_id`,
++  or deterministically derived via HKDF-SHA256 from the Meshtastic private key
++  when built with `-DRAUMATA_IDENTITY_DERIVED=1`), linked with the Meshtastic
++  `NodeNum` and Curve25519 public-key fingerprint in `raumata/link`.
++- **Name Synchronization**: defaults to Meshtastic `owner.long_name` /
++  `short_name` and tracks owner updates unless an explicit `raumata/mc_name`
++  override is set via `CMD_SET_ADVERT_NAME`.
++- **Presence**: staggered boot announcements (`T+15s` MeshCore advert, `T+20s`
++  Meshtastic `NodeInfo`) and 15-minute periodic adverts with deterministic
++  per-node jitter and GPS coordinates from `localPosition`.
++- **Persistence & Messaging**: up to 8 group channels (`raumata/mc_ch`) and 32
++  contacts (`raumata/mc_contacts`) persisted in NVS, direct and group text,
++  outbound ACK matching, push notifications (`PUSH_CODE_MSG_WAITING`,
++  `PUSH_CODE_SEND_CONFIRMED`, `PUSH_CODE_NEW_ADVERT`, `PUSH_CODE_ADVERT`,
++  `PUSH_CODE_PATH_UPDATED`), custom variables (`CMD_GET_CUSTOM_VARS`), and
++  core/radio/packet statistics (`CMD_GET_STATS`).
++
++## Companion interface
++
++A USB-serial mux parses both Meshtastic (`0x94 0xC3`) and MeshCore (`<`)
++framing. With `RAUMATA_COMPANION_MODE_BLE_USB=1` (enabled by default in
++`heltec-v3-dual`), USB starts in MeshCore companion mode so a Meshtastic app can
++connect over BLE while a MeshCore app connects over USB simultaneously without
++debug log or `FromRadio` queue contention.
++
++## Build
++
++```sh
++pio run -e heltec-v3-dual
++```

@@ -1,0 +1,744 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mio <mio@mio19.uk>
+Date: Fri, 23 Oct 2026 11:12:40 +1100
+Subject: [PATCH] raumata: add dual identity link and presence scheduler
+
+Add RaumataLinkRecord (NVS raumata/link), owner name synchronization, and PresenceScheduler:
+
+- Persist the mapping between the Meshtastic NodeNum, Meshtastic Curve25519 public-key fingerprint, and MeshCore Ed25519 public key, with optional HKDF-SHA256 derived identity mode (RAUMATA_IDENTITY_DERIVED).
+- Expose link and PHY variables via CMD_GET_CUSTOM_VARS/CMD_SET_CUSTOM_VAR, the 'link' CLI command, and Meshtastic ClientNotifications.
+- Stagger boot and periodic presence announcements across both stacks with deterministic per-node jitter and scale the MeshCore Dispatcher airtime budget factor to its allocated share of the regional duty cycle.
+
+diff --git a/src/raumata/IdentityLink.cpp b/src/raumata/IdentityLink.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..b8f6df6b07a2a2b7417c0651bada517ab78ed947
+--- /dev/null
++++ b/src/raumata/IdentityLink.cpp
+@@ -0,0 +1,178 @@
++#ifdef RAUMATA_DUAL_PROTOCOL
++#include "IdentityLink.h"
++
++#include <Arduino.h>
++#include <Preferences.h>
++#include <SHA256.h>
++#include <cstdio>
++#include <cstring>
++
++#include <Utils.h>
++
++#include "PhyProfile.h"
++#include "gps/RTC.h"
++#include "mesh/MeshService.h"
++#include "mesh/NodeDB.h"
++
++namespace raumata {
++namespace {
++
++RaumataLinkRecord gLinkRecord = {};
++
++void hmacSha256(const uint8_t *key, size_t keyLen, const uint8_t *data, size_t dataLen, uint8_t out[32])
++{
++    SHA256 sha;
++    sha.resetHMAC(key, keyLen);
++    sha.update(data, dataLen);
++    sha.finalizeHMAC(key, keyLen, out, 32);
++}
++
++} // namespace
++
++void computeMeshtasticPubKeyFingerprint(uint8_t fp[8])
++{
++    memset(fp, 0, 8);
++    if (config.security.public_key.size > 0) {
++        mesh::Utils::sha256(fp, 8, config.security.public_key.bytes, config.security.public_key.size);
++    } else if (owner.public_key.size > 0) {
++        mesh::Utils::sha256(fp, 8, owner.public_key.bytes, owner.public_key.size);
++    } else {
++        uint32_t nodeNum = nodeDB ? nodeDB->getNodeNum() : 0;
++        mesh::Utils::sha256(fp, 8, reinterpret_cast<const uint8_t *>(&nodeNum), sizeof(nodeNum));
++    }
++}
++
++bool deriveMeshCoreSeed(uint8_t seed[32])
++{
++    if (config.security.private_key.size < 32 ||
++        mesh::Utils::isZeroes(config.security.private_key.bytes, 32)) {
++        return false;
++    }
++
++    // HKDF-SHA256(ikm = Meshtastic private key, salt = "raumata", info = "meshcore-identity-v1", len = 32)
++    static constexpr const char kSalt[] = "raumata";
++    static constexpr const char kInfo[] = "meshcore-identity-v1";
++
++    uint8_t prk[32];
++    hmacSha256(reinterpret_cast<const uint8_t *>(kSalt), sizeof(kSalt) - 1,
++               config.security.private_key.bytes, 32, prk);
++
++    uint8_t infoBlock[sizeof(kInfo)];
++    memcpy(infoBlock, kInfo, sizeof(kInfo) - 1);
++    infoBlock[sizeof(kInfo) - 1] = 0x01;
++    hmacSha256(prk, sizeof(prk), infoBlock, sizeof(infoBlock), seed);
++    memset(prk, 0, sizeof(prk));
++    return true;
++}
++
++bool loadLinkRecord(RaumataLinkRecord &out)
++{
++    Preferences prefs;
++    if (!prefs.begin("raumata", true)) {
++        return false;
++    }
++
++    size_t len = prefs.getBytesLength("link");
++    if (len != sizeof(RaumataLinkRecord)) {
++        prefs.end();
++        return false;
++    }
++
++    bool ok = prefs.getBytes("link", &out, sizeof(out)) == sizeof(out);
++    prefs.end();
++    return ok && out.version == kLinkRecordVersion;
++}
++
++const RaumataLinkRecord &activeLinkRecord()
++{
++    return gLinkRecord;
++}
++
++bool syncIdentityLink(const uint8_t mcPubKey[32], uint32_t nowSec, bool emitNotification)
++{
++    if (!mcPubKey) {
++        return false;
++    }
++
++    RaumataLinkRecord existing = {};
++    bool hadSaved = loadLinkRecord(existing);
++
++    uint8_t fp[8];
++    computeMeshtasticPubKeyFingerprint(fp);
++    uint32_t nodeNum = nodeDB ? nodeDB->getNodeNum() : 0;
++
++#if defined(RAUMATA_IDENTITY_DERIVED) && RAUMATA_IDENTITY_DERIVED
++    uint8_t mode = RAUMATA_ID_DERIVED;
++#else
++    uint8_t mode = RAUMATA_ID_INDEPENDENT;
++#endif
++
++    bool changed = !hadSaved || existing.version != kLinkRecordVersion || existing.mode != mode ||
++                   existing.msh_node_num != nodeNum ||
++                   memcmp(existing.mc_pubkey, mcPubKey, sizeof(existing.mc_pubkey)) != 0 ||
++                   memcmp(existing.msh_pubkey_fp, fp, sizeof(existing.msh_pubkey_fp)) != 0;
++
++    gLinkRecord.version = kLinkRecordVersion;
++    gLinkRecord.mode = mode;
++    gLinkRecord.msh_node_num = nodeNum;
++    memcpy(gLinkRecord.mc_pubkey, mcPubKey, sizeof(gLinkRecord.mc_pubkey));
++    memcpy(gLinkRecord.msh_pubkey_fp, fp, sizeof(gLinkRecord.msh_pubkey_fp));
++    gLinkRecord.updated = changed ? nowSec : existing.updated;
++
++    if (changed) {
++        Preferences prefs;
++        if (prefs.begin("raumata", false)) {
++            prefs.putBytes("link", &gLinkRecord, sizeof(gLinkRecord));
++            prefs.end();
++        }
++    }
++
++    if (changed && emitNotification && service) {
++        meshtastic_ClientNotification *cn = clientNotificationPool.allocZeroed();
++        if (cn) {
++            cn->level = meshtastic_LogRecord_Level_INFO;
++            cn->time = getValidTime(RTCQualityFromNet);
++            formatLinkSummary(cn->message, sizeof(cn->message));
++            service->sendClientNotification(cn);
++        }
++    }
++
++    return changed;
++}
++
++void formatCustomVars(char *dest, size_t destSize)
++{
++    if (!dest || destSize == 0) {
++        return;
++    }
++
++    char mshFpHex[17];
++    char mcPrefixHex[17];
++    mesh::Utils::toHex(mshFpHex, gLinkRecord.msh_pubkey_fp, sizeof(gLinkRecord.msh_pubkey_fp));
++    mesh::Utils::toHex(mcPrefixHex, gLinkRecord.mc_pubkey, 8);
++
++    const PhyProfile &phy = activePhyProfile();
++    snprintf(dest, destSize, "msh.node:%08x,msh.pubkey:%s,mc.pubkey:%s,phy.id:%u,phy.name:%s,phy.sync:%02X",
++             static_cast<unsigned int>(gLinkRecord.msh_node_num), mshFpHex, mcPrefixHex, phy.id, phy.name,
++             activeSyncWord());
++}
++
++void formatLinkSummary(char *dest, size_t destSize)
++{
++    if (!dest || destSize == 0) {
++        return;
++    }
++
++    char mshFpHex[17];
++    char mcPrefixHex[17];
++    mesh::Utils::toHex(mshFpHex, gLinkRecord.msh_pubkey_fp, sizeof(gLinkRecord.msh_pubkey_fp));
++    mesh::Utils::toHex(mcPrefixHex, gLinkRecord.mc_pubkey, 8);
++
++    const char *modeStr = gLinkRecord.mode == RAUMATA_ID_DERIVED ? "derived" : "independent";
++    snprintf(dest, destSize, "raumata.link mode=%s msh=!%08x fp=%s mc=%s", modeStr,
++             static_cast<unsigned int>(gLinkRecord.msh_node_num), mshFpHex, mcPrefixHex);
++}
++
++} // namespace raumata
++
++#endif // RAUMATA_DUAL_PROTOCOL
+diff --git a/src/raumata/IdentityLink.h b/src/raumata/IdentityLink.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..d3242f74e4b034498e6b0617af5205caa5f6224a
+--- /dev/null
++++ b/src/raumata/IdentityLink.h
+@@ -0,0 +1,47 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++namespace raumata {
++
++enum RaumataIdentityMode : uint8_t {
++    RAUMATA_ID_INDEPENDENT = 0,
++    RAUMATA_ID_DERIVED = 1,
++    RAUMATA_ID_CROSS_SIGNED = 2,
++};
++
++struct RaumataLinkRecord {
++    uint8_t version;          // 1
++    uint8_t mode;             // RaumataIdentityMode
++    uint32_t msh_node_num;    // Meshtastic NodeNum
++    uint8_t mc_pubkey[32];    // MeshCore Ed25519 public key
++    uint8_t msh_pubkey_fp[8]; // Truncated SHA-256 of Meshtastic Curve25519 public key
++    uint32_t updated;         // RTC timestamp when last updated
++};
++
++constexpr uint8_t kLinkRecordVersion = 1;
++
++/// Compute the 8-byte SHA-256 fingerprint of the active Meshtastic public key.
++void computeMeshtasticPubKeyFingerprint(uint8_t fp[8]);
++
++/// Derive a deterministic 32-byte Ed25519 seed from the Meshtastic private key (Mode B).
++bool deriveMeshCoreSeed(uint8_t seed[32]);
++
++/// Load the saved link record from NVS, if present.
++bool loadLinkRecord(RaumataLinkRecord &out);
++
++/// Return the active in-memory link record.
++const RaumataLinkRecord &activeLinkRecord();
++
++/// Synchronize the link record with the current Meshtastic NodeDB and MeshCore public key.
++/// Returns true if the link record changed and was persisted to NVS.
++bool syncIdentityLink(const uint8_t mcPubKey[32], uint32_t nowSec, bool emitNotification = true);
++
++/// Format link and PHY custom variables as comma-separated key:value pairs for CMD_GET_CUSTOM_VARS.
++void formatCustomVars(char *dest, size_t destSize);
++
++/// Format a human-readable summary of the identity link for CLI queries.
++void formatLinkSummary(char *dest, size_t destSize);
++
++} // namespace raumata
+diff --git a/src/raumata/MeshCoreNode.cpp b/src/raumata/MeshCoreNode.cpp
+index 3a326fb4fff0a52e0ad2f1a54255225900cd81ef..fec72aac0a2ae547e67ed0109be6b3ad292498bd 100644
+--- a/src/raumata/MeshCoreNode.cpp
++++ b/src/raumata/MeshCoreNode.cpp
+@@ -7,8 +7,10 @@
+ 
+ #include "CompanionProtocol.h"
+ #include "FSCommon.h"
++#include "IdentityLink.h"
+ #include "PhyProfile.h"
+ #include "PowerStatus.h"
++#include "PresenceScheduler.h"
+ #include "gps/RTC.h"
+ #include "mesh/NodeDB.h"
+ 
+@@ -31,25 +33,65 @@ void MeshCoreNode::begin()
+     loadName();
+     loadChannels();
+     loadContacts();
++    syncIdentityLink(self_id.pub_key, getRTCClock()->getCurrentTime(), false);
+ 
+     BaseChatMesh::begin();
+-    sendSelfAdvert(true);
+     lastAdvertMs_ = millis();
+ }
+ 
+ void MeshCoreNode::loop()
+ {
+     BaseChatMesh::loop();
++}
+ 
+-    uint32_t now = millis();
+-    if (now - lastAdvertMs_ >= kAdvertIntervalMs) {
+-        sendSelfAdvert(true);
+-        lastAdvertMs_ = now;
+-    }
++float MeshCoreNode::getAirtimeBudgetFactor() const
++{
++    return PresenceScheduler::meshCoreBudgetFactor();
+ }
+ 
+ void MeshCoreNode::loadIdentity()
+ {
++#if defined(RAUMATA_IDENTITY_DERIVED) && RAUMATA_IDENTITY_DERIVED
++    class SeedRng : public mesh::RNG
++    {
++      public:
++        explicit SeedRng(const uint8_t seed[32]) { memcpy(seed_, seed, 32); }
++        void random(uint8_t *dest, size_t sz) override
++        {
++            for (size_t i = 0; i < sz; i++) {
++                dest[i] = seed_[i % 32];
++            }
++        }
++
++      private:
++        uint8_t seed_[32];
++    };
++
++    RaumataLinkRecord link = {};
++    uint8_t currentFp[8];
++    computeMeshtasticPubKeyFingerprint(currentFp);
++    bool fpMatches = loadLinkRecord(link) && link.mode == RAUMATA_ID_DERIVED &&
++                     memcmp(link.msh_pubkey_fp, currentFp, sizeof(currentFp)) == 0;
++
++    if (!fpMatches) {
++        uint8_t seed[32];
++        if (deriveMeshCoreSeed(seed)) {
++            SeedRng seedRng(seed);
++            self_id = mesh::LocalIdentity(&seedRng);
++            memset(seed, 0, sizeof(seed));
++
++            Preferences prefs;
++            if (prefs.begin("raumata", false)) {
++                uint8_t buf[PRV_KEY_SIZE + PUB_KEY_SIZE];
++                size_t len = self_id.writeTo(buf, sizeof(buf));
++                prefs.putBytes("mc_id", buf, len);
++                prefs.end();
++            }
++            return;
++        }
++    }
++#endif
++
+     Preferences prefs;
+     if (prefs.begin("raumata", true)) {
+         size_t len = prefs.getBytesLength("mc_id");
+@@ -371,9 +413,14 @@ void MeshCoreNode::onCLICommandRecv(const ContactInfo &contact, mesh::Packet *pa
+         return;
+     }
+     reply[0] = 0;
+-    if (text) {
+-        handlePhyCliCommand(text, reply, 150);
++    if (!text) {
++        return;
++    }
++    if (strcmp(text, "link") == 0) {
++        formatLinkSummary(reply, 150);
++        return;
+     }
++    handlePhyCliCommand(text, reply, 150);
+ }
+ 
+ void MeshCoreNode::onSignedMessageRecv(const ContactInfo &contact, mesh::Packet *packet, uint32_t senderTimestamp,
+@@ -718,6 +765,16 @@ void MeshCoreNode::writeStats(uint8_t statsType)
+     writer_(frame, i);
+ }
+ 
++void MeshCoreNode::writeCustomVars()
++{
++    uint8_t frame[MAX_FRAME_SIZE];
++    frame[0] = RESP_CODE_CUSTOM_VARS;
++    char *vars = reinterpret_cast<char *>(&frame[1]);
++    vars[0] = 0;
++    formatCustomVars(vars, sizeof(frame) - 1);
++    writer_(frame, 1 + strlen(vars));
++}
++
+ void MeshCoreNode::writePhyProfiles()
+ {
+     size_t count = 0;
+@@ -1089,6 +1146,46 @@ void MeshCoreNode::handleCommand(uint8_t command, const uint8_t *frame, size_t l
+         writeStats(len >= 2 ? frame[1] : STATS_TYPE_CORE);
+         break;
+ 
++    case CMD_GET_CUSTOM_VARS:
++        writeCustomVars();
++        break;
++
++    case CMD_SET_CUSTOM_VAR:
++        if (len >= 4) {
++            char kv[96];
++            size_t kvLen = len - 1;
++            if (kvLen > sizeof(kv) - 1) {
++                kvLen = sizeof(kv) - 1;
++            }
++            memcpy(kv, &frame[1], kvLen);
++            kv[kvLen] = 0;
++
++            char *colon = strchr(kv, ':');
++            if (!colon) {
++                writeError(ERR_CODE_ILLEGAL_ARG);
++                break;
++            }
++            *colon = 0;
++            const char *key = kv;
++            const char *val = colon + 1;
++            if (strcmp(key, "phy.id") == 0) {
++                uint8_t id = static_cast<uint8_t>(strtoul(val, nullptr, 10));
++                if (applyPhyProfile(id)) {
++                    writeOK();
++                } else {
++                    writeError(ERR_CODE_NOT_FOUND);
++                }
++            } else if (strcmp(key, "mc.name") == 0 && val[0] != 0) {
++                setNodeName(val);
++                writeOK();
++            } else {
++                writeError(ERR_CODE_ILLEGAL_ARG);
++            }
++        } else {
++            writeError(ERR_CODE_ILLEGAL_ARG);
++        }
++        break;
++
+     case CMD_REBOOT:
+         if (len >= 7 && memcmp(&frame[1], "reboot", 6) == 0) {
+             ESP.restart();
+@@ -1189,7 +1286,10 @@ void MeshCoreNode::handleCommand(uint8_t command, const uint8_t *frame, size_t l
+             replyFrame[0] = RESP_CODE_CLI_REPLY;
+             char *replyText = reinterpret_cast<char *>(&replyFrame[1]);
+             replyText[0] = 0;
+-            if (handlePhyCliCommand(cmd, replyText, sizeof(replyFrame) - 1)) {
++            if (strcmp(cmd, "link") == 0) {
++                formatLinkSummary(replyText, sizeof(replyFrame) - 1);
++                writer_(replyFrame, 1 + strlen(replyText));
++            } else if (handlePhyCliCommand(cmd, replyText, sizeof(replyFrame) - 1)) {
+                 writer_(replyFrame, 1 + strlen(replyText));
+             } else {
+                 writeError(ERR_CODE_UNSUPPORTED_CMD);
+diff --git a/src/raumata/MeshCoreNode.h b/src/raumata/MeshCoreNode.h
+index 4af2cee8205fa4ba6a8a66a344f42ed9e5e88937..36723d5e6b1acd1d68a4bd6d4d344776a391a598 100644
+--- a/src/raumata/MeshCoreNode.h
++++ b/src/raumata/MeshCoreNode.h
+@@ -31,7 +31,8 @@ class MeshCoreNode : public BaseChatMesh
+     void sendSelfAdvert(bool flood);
+ 
+   protected:
+-    // BaseChatMesh hooks
++    // Dispatcher / BaseChatMesh hooks
++    float getAirtimeBudgetFactor() const override;
+     void onDiscoveredContact(ContactInfo &contact, bool isNew, uint8_t pathLen, const uint8_t *path) override;
+     ContactInfo *processAck(const uint8_t *data) override;
+     void onContactPathUpdated(const ContactInfo &contact) override;
+@@ -107,6 +108,7 @@ class MeshCoreNode : public BaseChatMesh
+     void writeChannel(uint8_t idx);
+     void writeNextMessage();
+     void writeStats(uint8_t statsType);
++    void writeCustomVars();
+     void writePhyProfiles();
+     void writeActivePhyProfile();
+     void writeContactFrame(uint8_t code, const ContactInfo &contact);
+diff --git a/src/raumata/PresenceScheduler.cpp b/src/raumata/PresenceScheduler.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..8c393a500a2aa16f0d776a86931ed32f6a073a55
+--- /dev/null
++++ b/src/raumata/PresenceScheduler.cpp
+@@ -0,0 +1,112 @@
++#ifdef RAUMATA_DUAL_PROTOCOL
++#include "PresenceScheduler.h"
++
++#include <Arduino.h>
++
++#include "MeshCoreNode.h"
++#include "airtime.h"
++#include "mesh/MeshRadio.h"
++#include "modules/NodeInfoModule.h"
++
++namespace raumata {
++
++void PresenceScheduler::begin(MeshCoreNode &node)
++{
++    bootMs_ = millis();
++    const uint8_t *pub = node.identity().pub_key;
++    uint16_t seed = static_cast<uint16_t>((static_cast<uint16_t>(pub[0]) << 8) | pub[1]);
++    // 30 s offset + 0..30 s deterministic jitter derived from node identity
++    jitterMs_ = 30000UL + (static_cast<uint32_t>(seed) % 30000UL);
++
++    nextMeshCoreAdvertMs_ = bootMs_ + kBootMeshCoreDelayMs;
++    nextMeshtasticNodeInfoMs_ = bootMs_ + kBootMeshtasticDelayMs;
++    bootMeshCoreSent_ = false;
++    bootMeshtasticSent_ = false;
++    pendingReAdvertMeshCore_ = false;
++    pendingReAdvertMeshtastic_ = false;
++}
++
++void PresenceScheduler::loop(MeshCoreNode &node)
++{
++    uint32_t now = millis();
++
++    if (!bootMeshCoreSent_ && static_cast<int32_t>(now - nextMeshCoreAdvertMs_) >= 0) {
++        bootMeshCoreSent_ = true;
++        if (canSendBackgroundAdvert(250)) {
++            node.sendSelfAdvert(true);
++        }
++        nextMeshCoreAdvertMs_ = now + kPeriodicIntervalMs + jitterMs_;
++    }
++
++    if (!bootMeshtasticSent_ && static_cast<int32_t>(now - nextMeshtasticNodeInfoMs_) >= 0) {
++        bootMeshtasticSent_ = true;
++        if (nodeInfoModule && canSendBackgroundAdvert(250)) {
++            nodeInfoModule->sendOurNodeInfo(NODENUM_BROADCAST, false, 0, true);
++        }
++    }
++
++    if (bootMeshCoreSent_ && pendingReAdvertMeshCore_ && static_cast<int32_t>(now - nextMeshCoreAdvertMs_) >= 0) {
++        pendingReAdvertMeshCore_ = false;
++        if (canSendBackgroundAdvert(250)) {
++            node.sendSelfAdvert(true);
++        }
++        nextMeshCoreAdvertMs_ = now + kPeriodicIntervalMs + jitterMs_;
++    }
++
++    if (bootMeshtasticSent_ && pendingReAdvertMeshtastic_ &&
++        static_cast<int32_t>(now - nextMeshtasticNodeInfoMs_) >= 0) {
++        pendingReAdvertMeshtastic_ = false;
++        if (nodeInfoModule && canSendBackgroundAdvert(250)) {
++            nodeInfoModule->sendOurNodeInfo(NODENUM_BROADCAST, false, 0, true);
++        }
++    }
++
++    if (bootMeshCoreSent_ && !pendingReAdvertMeshCore_ && static_cast<int32_t>(now - nextMeshCoreAdvertMs_) >= 0) {
++        if (canSendBackgroundAdvert(250)) {
++            node.sendSelfAdvert(true);
++        }
++        nextMeshCoreAdvertMs_ = now + kPeriodicIntervalMs + jitterMs_;
++    }
++}
++
++void PresenceScheduler::scheduleReAdvertise()
++{
++    uint32_t now = millis();
++    if (lastReAdvertMs_ != 0 && (now - lastReAdvertMs_) < kReAdvertCooldownMs) {
++        return;
++    }
++    lastReAdvertMs_ = now;
++    pendingReAdvertMeshCore_ = true;
++    pendingReAdvertMeshtastic_ = true;
++    nextMeshCoreAdvertMs_ = now + 5000UL;
++    nextMeshtasticNodeInfoMs_ = now + 10000UL;
++}
++
++float PresenceScheduler::meshCoreBudgetFactor()
++{
++    // Dispatcher uses duty_cycle = 1.0f / (1.0f + getAirtimeBudgetFactor()).
++    // Cap total channel TX utilization to the regional duty cycle (or 10% for
++    // unrestricted regions) and give MeshCore kDefaultMeshCoreShare (25%).
++    float regionDuty = (myRegion && myRegion->dutyCycle > 0.0f && myRegion->dutyCycle < 100.0f)
++                           ? (myRegion->dutyCycle / 100.0f)
++                           : 0.10f;
++    float mcDuty = regionDuty * kDefaultMeshCoreShare;
++    if (mcDuty <= 0.0005f) {
++        mcDuty = 0.0005f;
++    }
++    float factor = (1.0f / mcDuty) - 1.0f;
++    return factor < 1.0f ? 1.0f : factor;
++}
++
++bool PresenceScheduler::canSendBackgroundAdvert(uint32_t estAirtimeMs)
++{
++    (void)estAirtimeMs;
++    if (!airTime) {
++        return true;
++    }
++    return airTime->isTxAllowedChannelUtil(true) && airTime->isTxAllowedAirUtil();
++}
++
++} // namespace raumata
++
++#endif // RAUMATA_DUAL_PROTOCOL
+diff --git a/src/raumata/PresenceScheduler.h b/src/raumata/PresenceScheduler.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..6588c27e391790435f84ca137d1278984c0826e8
+--- /dev/null
++++ b/src/raumata/PresenceScheduler.h
+@@ -0,0 +1,52 @@
++#pragma once
++
++#include <cstdint>
++
++namespace raumata {
++
++class MeshCoreNode;
++
++/**
++ * Shared airtime policy and staggered presence scheduler for Meshtastic + MeshCore.
++ *
++ * - Staggers boot announcements (MeshCore advert at T+15 s, Meshtastic NodeInfo at T+20 s).
++ * - Schedules periodic MeshCore adverts every 15 minutes with deterministic per-node
++ *   jitter so dual nodes do not synchronize bursts.
++ * - Rate-limits re-advertisements triggered by PHY profile or owner changes.
++ * - Computes the MeshCore Dispatcher airtime budget factor so MeshCore stays within its
++ *   allocated share (default 25%) of the regional duty cycle.
++ */
++class PresenceScheduler
++{
++  public:
++    static constexpr uint32_t kBootMeshCoreDelayMs = 15UL * 1000UL;
++    static constexpr uint32_t kBootMeshtasticDelayMs = 20UL * 1000UL;
++    static constexpr uint32_t kPeriodicIntervalMs = 15UL * 60UL * 1000UL;
++    static constexpr uint32_t kReAdvertCooldownMs = 60UL * 1000UL;
++    static constexpr float kDefaultMeshCoreShare = 0.25f;
++
++    void begin(MeshCoreNode &node);
++    void loop(MeshCoreNode &node);
++
++    /// Schedule a staggered re-advertisement on both stacks after a PHY or identity change.
++    void scheduleReAdvertise();
++
++    /// Compute the Dispatcher airtime budget factor for the MeshCore stack.
++    static float meshCoreBudgetFactor();
++
++    /// Check whether background presence traffic is permitted under the shared airtime budget.
++    static bool canSendBackgroundAdvert(uint32_t estAirtimeMs);
++
++  private:
++    uint32_t bootMs_ = 0;
++    uint32_t nextMeshCoreAdvertMs_ = 0;
++    uint32_t nextMeshtasticNodeInfoMs_ = 0;
++    uint32_t lastReAdvertMs_ = 0;
++    uint32_t jitterMs_ = 0;
++    bool bootMeshCoreSent_ = false;
++    bool bootMeshtasticSent_ = false;
++    bool pendingReAdvertMeshCore_ = false;
++    bool pendingReAdvertMeshtastic_ = false;
++};
++
++} // namespace raumata
+diff --git a/src/raumata/RaumataProtocol.cpp b/src/raumata/RaumataProtocol.cpp
+index 49ec739aeeabe9d73450f0efde5b2c98052f58b2..8f86eef8a08a0f83de28fc7a986ba4df02a25f65 100644
+--- a/src/raumata/RaumataProtocol.cpp
++++ b/src/raumata/RaumataProtocol.cpp
+@@ -14,11 +14,16 @@
+ #include <helpers/StaticPoolPacketManager.h>
+ 
+ #include "CompanionSerial.h"
++#include "IdentityLink.h"
+ #include "MeshCoreNode.h"
+ #include "MeshCoreRadio.h"
++#include "Observer.h"
+ #include "PhyProfile.h"
++#include "PresenceScheduler.h"
+ #include "SerialConsole.h"
+ #include "gps/RTC.h"
++#include "mesh/MeshService.h"
++#include "mesh/NodeDB.h"
+ 
+ namespace raumata {
+ namespace {
+@@ -62,6 +67,7 @@ EspRng gRng;
+ MeshtasticClock gClock;
+ MeshtasticRtc gRtc;
+ SimpleMeshTables gTables;
++PresenceScheduler gPresence;
+ 
+ StaticPoolPacketManager *gManager = nullptr;
+ MeshCoreRadio *gRadio = nullptr;
+@@ -76,6 +82,61 @@ void writeFrame(const uint8_t *frame, size_t len)
+     }
+ }
+ 
++void syncOwnerAndLink()
++{
++    if (!gNode) {
++        return;
++    }
++
++    const char *ownerName = owner.long_name[0] ? owner.long_name : owner.short_name;
++    bool nameChanged = false;
++    if (!gNode->hasNameOverride() && ownerName[0] && strcmp(gNode->nodeName(), ownerName) != 0) {
++        gNode->syncDefaultName(ownerName);
++        nameChanged = true;
++    }
++
++    bool linkChanged = syncIdentityLink(gNode->identity().pub_key, getTime(), true);
++    if (nameChanged || linkChanged) {
++        gPresence.scheduleReAdvertise();
++    }
++}
++
++class RaumataObserver
++{
++  public:
++    void observe()
++    {
++        if (service) {
++            configObserver_.observe(&service->configChanged);
++        }
++        if (nodeDB) {
++            statusObserver_.observe(&nodeDB->newStatus);
++        }
++    }
++
++  private:
++    int onConfigChanged(void *)
++    {
++        if (!isApplyingPhyProfile()) {
++            onMeshtasticConfigChanged();
++        }
++        syncOwnerAndLink();
++        return 0;
++    }
++
++    int onStatusChanged(const meshtastic::NodeStatus *)
++    {
++        syncOwnerAndLink();
++        return 0;
++    }
++
++    CallbackObserver<RaumataObserver, void *> configObserver_{this, &RaumataObserver::onConfigChanged};
++    CallbackObserver<RaumataObserver, const meshtastic::NodeStatus *> statusObserver_{
++        this, &RaumataObserver::onStatusChanged};
++};
++
++RaumataObserver gObserver;
++
+ } // namespace
+ 
+ void init(RadioInterface *radio)
+@@ -84,7 +145,7 @@ void init(RadioInterface *radio)
+         return;
+     }
+ 
+-    bindPhyRadio(radio);
++    bindPhyRadio(radio, []() { gPresence.scheduleReAdvertise(); });
+ 
+     gManager = new StaticPoolPacketManager(16);
+     gRadio = new MeshCoreRadio(*radio);
+@@ -93,7 +154,9 @@ void init(RadioInterface *radio)
+ 
+     gActive = true;
+     gNode->begin();
++    gPresence.begin(*gNode);
+     gCompanion->begin();
++    gObserver.observe();
+ }
+ 
+ void loop()
+@@ -104,6 +167,7 @@ void loop()
+ 
+     gCompanion->loop();
+     gNode->loop();
++    gPresence.loop(*gNode);
+ }
+ 
+ bool serialMuxActive()

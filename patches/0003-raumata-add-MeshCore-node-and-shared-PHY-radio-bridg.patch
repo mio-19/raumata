@@ -1,21 +1,25 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Mio <mio@mio19.uk>
-Date: Thu, 22 Oct 2026 23:00:40 +1100
+Date: Fri, 23 Oct 2026 11:04:41 +1100
 Subject: [PATCH] raumata: add MeshCore node and shared-PHY radio bridge
 
-Implement a mesh::Radio bridge that reuses Meshtastic's SX1262 through the raw-frame API, tags MeshCore frames with RAUM, and queues received frames for the MeshCore dispatcher. Add a BaseChatMesh node with NVS identity, persisted channels, adverts, direct/group text, and a companion-protocol command subset.
+Add MeshCoreRadio and MeshCoreNode on top of the shared RadioInterface:
+
+- Prepend/strip the 4-byte RAUM transport tag so MeshCore frames are demultiplexed from Meshtastic frames on the same PHY, using RadioInterface::isChannelBusy() for CAD backoff.
+- Persist MeshCore identity, channels, and discovered contacts in NVS.
+- Implement companion commands (device/self info with GPS coordinates and TX power, contacts CRUD/import/export, channels, direct/group text, ACK tracking, push notifications, and core/radio/packet stats).
 
 diff --git a/src/raumata/CompanionProtocol.h b/src/raumata/CompanionProtocol.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..a54e756c1183a1c04a3209e184f9eb14ff7964df
+index 0000000000000000000000000000000000000000..1572eb49526409f26c6ef79da2396d8e42a64499
 --- /dev/null
 +++ b/src/raumata/CompanionProtocol.h
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,93 @@
 +#pragma once
 +
 +#include <stdint.h>
 +
-+// Subset of the MeshCore companion protocol used by the Raumata bridge.
++// MeshCore companion protocol constants used by the Raumata bridge.
 +namespace raumata::protocol {
 +
 +// App -> firmware
@@ -27,16 +31,29 @@ index 0000000000000000000000000000000000000000..a54e756c1183a1c04a3209e184f9eb14
 +constexpr uint8_t CMD_SET_DEVICE_TIME = 6;
 +constexpr uint8_t CMD_SEND_SELF_ADVERT = 7;
 +constexpr uint8_t CMD_SET_ADVERT_NAME = 8;
++constexpr uint8_t CMD_ADD_UPDATE_CONTACT = 9;
 +constexpr uint8_t CMD_SYNC_NEXT_MESSAGE = 10;
++constexpr uint8_t CMD_SET_RADIO_PARAMS = 11;
++constexpr uint8_t CMD_SET_RADIO_TX_POWER = 12;
++constexpr uint8_t CMD_RESET_PATH = 13;
++constexpr uint8_t CMD_REMOVE_CONTACT = 15;
++constexpr uint8_t CMD_EXPORT_CONTACT = 17;
++constexpr uint8_t CMD_IMPORT_CONTACT = 18;
 +constexpr uint8_t CMD_REBOOT = 19;
 +constexpr uint8_t CMD_GET_BATT_AND_STORAGE = 20;
 +constexpr uint8_t CMD_DEVICE_QUERY = 22;
 +constexpr uint8_t CMD_GET_CONTACT_BY_KEY = 30;
 +constexpr uint8_t CMD_GET_CHANNEL = 31;
 +constexpr uint8_t CMD_SET_CHANNEL = 32;
-+constexpr uint8_t CMD_SET_RADIO_PARAMS = 11;
-+constexpr uint8_t CMD_SET_RADIO_TX_POWER = 12;
++constexpr uint8_t CMD_GET_CUSTOM_VARS = 40;
++constexpr uint8_t CMD_SET_CUSTOM_VAR = 41;
++constexpr uint8_t CMD_RUN_CLI_COMMAND = 50;
 +constexpr uint8_t CMD_GET_STATS = 56;
++
++// Raumata shared-PHY extension commands
++constexpr uint8_t CMD_GET_PHY_PROFILES = 0xE0;
++constexpr uint8_t CMD_GET_PHY_PROFILE = 0xE1;
++constexpr uint8_t CMD_SET_PHY_PROFILE = 0xE2;
 +
 +// Firmware -> app
 +constexpr uint8_t RESP_CODE_OK = 0;
@@ -50,12 +67,29 @@ index 0000000000000000000000000000000000000000..a54e756c1183a1c04a3209e184f9eb14
 +constexpr uint8_t RESP_CODE_CHANNEL_MSG_RECV = 8;
 +constexpr uint8_t RESP_CODE_CURR_TIME = 9;
 +constexpr uint8_t RESP_CODE_NO_MORE_MESSAGES = 10;
++constexpr uint8_t RESP_CODE_EXPORT_CONTACT = 11;
 +constexpr uint8_t RESP_CODE_BATT_AND_STORAGE = 12;
 +constexpr uint8_t RESP_CODE_DEVICE_INFO = 13;
 +constexpr uint8_t RESP_CODE_CONTACT_MSG_RECV_V3 = 16;
 +constexpr uint8_t RESP_CODE_CHANNEL_MSG_RECV_V3 = 17;
 +constexpr uint8_t RESP_CODE_CHANNEL_INFO = 18;
++constexpr uint8_t RESP_CODE_CUSTOM_VARS = 21;
++constexpr uint8_t RESP_CODE_STATS = 24;
++constexpr uint8_t RESP_CODE_CLI_REPLY = 50;
++constexpr uint8_t RESP_CODE_PHY_PROFILES = 0xE0;
++constexpr uint8_t RESP_CODE_PHY_PROFILE = 0xE1;
++
++// Asynchronous push notifications (firmware -> app)
++constexpr uint8_t PUSH_CODE_ADVERT = 0x80;
++constexpr uint8_t PUSH_CODE_PATH_UPDATED = 0x81;
++constexpr uint8_t PUSH_CODE_SEND_CONFIRMED = 0x82;
 +constexpr uint8_t PUSH_CODE_MSG_WAITING = 0x83;
++constexpr uint8_t PUSH_CODE_NEW_ADVERT = 0x8A;
++
++// Stats sub-types for CMD_GET_STATS
++constexpr uint8_t STATS_TYPE_CORE = 0;
++constexpr uint8_t STATS_TYPE_RADIO = 1;
++constexpr uint8_t STATS_TYPE_PACKETS = 2;
 +
 +constexpr uint8_t ERR_CODE_UNSUPPORTED_CMD = 1;
 +constexpr uint8_t ERR_CODE_NOT_FOUND = 2;
@@ -67,8 +101,8 @@ index 0000000000000000000000000000000000000000..a54e756c1183a1c04a3209e184f9eb14
 +constexpr uint8_t RAUMATA_TXT_TYPE_PLAIN = 0;
 +
 +constexpr uint8_t FIRMWARE_VER_CODE = 14;
-+constexpr const char *FIRMWARE_VERSION = "raumata-0.1";
-+constexpr const char *FIRMWARE_BUILD_DATE = "22 Oct 2026";
++constexpr const char *FIRMWARE_VERSION = "raumata-0.2";
++constexpr const char *FIRMWARE_BUILD_DATE = "23 Oct 2026";
 +constexpr const char *MANUFACTURER_NAME = "Raumata";
 +
 +#define RAUMATA_PUBLIC_GROUP_PSK "izOH6cXN6mrJ5e26oRXNcg=="
@@ -76,10 +110,10 @@ index 0000000000000000000000000000000000000000..a54e756c1183a1c04a3209e184f9eb14
 +} // namespace raumata::protocol
 diff --git a/src/raumata/MeshCoreNode.cpp b/src/raumata/MeshCoreNode.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..7dd3d4c975df364ea955add2f76814b23a6fe02b
+index 0000000000000000000000000000000000000000..958a1bc24029909774314c04c7bee177cc44d501
 --- /dev/null
 +++ b/src/raumata/MeshCoreNode.cpp
-@@ -0,0 +1,732 @@
+@@ -0,0 +1,1041 @@
 +#ifdef RAUMATA_DUAL_PROTOCOL
 +#include "MeshCoreNode.h"
 +
@@ -111,6 +145,7 @@ index 0000000000000000000000000000000000000000..7dd3d4c975df364ea955add2f76814b2
 +    loadIdentity();
 +    loadName();
 +    loadChannels();
++    loadContacts();
 +
 +    BaseChatMesh::begin();
 +    sendSelfAdvert(true);
@@ -161,12 +196,14 @@ index 0000000000000000000000000000000000000000..7dd3d4c975df364ea955add2f76814b2
 +        String saved = prefs.getString("mc_name", "");
 +        prefs.end();
 +        if (saved.length() > 0) {
++            hasNameOverride_ = true;
 +            strncpy(nodeName_, saved.c_str(), sizeof(nodeName_) - 1);
 +            nodeName_[sizeof(nodeName_) - 1] = 0;
 +            return;
 +        }
 +    }
 +
++    hasNameOverride_ = false;
 +    const char *source = owner.long_name[0] ? owner.long_name : owner.short_name;
 +    if (source[0]) {
 +        strncpy(nodeName_, source, sizeof(nodeName_) - 1);
@@ -215,6 +252,56 @@ index 0000000000000000000000000000000000000000..7dd3d4c975df364ea955add2f76814b2
 +    }
 +}
 +
++void MeshCoreNode::loadContacts()
++{
++    Preferences prefs;
++    if (!prefs.begin("raumata", true)) {
++        return;
++    }
++
++    size_t len = prefs.getBytesLength("mc_contacts");
++    if (len > 0 && len % sizeof(ContactInfo) == 0 && len <= sizeof(ContactInfo) * MAX_CONTACTS) {
++        size_t count = len / sizeof(ContactInfo);
++        ContactInfo saved[MAX_CONTACTS];
++        if (prefs.getBytes("mc_contacts", saved, len) == len) {
++            for (size_t i = 0; i < count; i++) {
++                if (saved[i].type != 0 && saved[i].name[0] != 0) {
++                    addContact(saved[i]);
++                }
++            }
++        }
++    }
++    prefs.end();
++}
++
++void MeshCoreNode::saveContacts()
++{
++    ContactInfo saved[MAX_CONTACTS];
++    size_t count = 0;
++
++    ContactInfo contact;
++    int slots = getTotalContactSlots();
++    for (int idx = 0; idx < slots && count < MAX_CONTACTS; idx++) {
++        if (!getContactByIdx(idx, contact)) {
++            break;
++        }
++        if (contact.type == 0 || contact.name[0] == 0) {
++            continue;
++        }
++        saved[count++] = contact;
++    }
++
++    Preferences prefs;
++    if (prefs.begin("raumata", false)) {
++        if (count > 0) {
++            prefs.putBytes("mc_contacts", saved, count * sizeof(ContactInfo));
++        } else {
++            prefs.remove("mc_contacts");
++        }
++        prefs.end();
++    }
++}
++
 +void MeshCoreNode::saveName()
 +{
 +    Preferences prefs;
@@ -226,14 +313,32 @@ index 0000000000000000000000000000000000000000..7dd3d4c975df364ea955add2f76814b2
 +
 +void MeshCoreNode::setNodeName(const char *name)
 +{
++    hasNameOverride_ = true;
 +    strncpy(nodeName_, name, sizeof(nodeName_) - 1);
 +    nodeName_[sizeof(nodeName_) - 1] = 0;
 +    saveName();
 +}
 +
++void MeshCoreNode::syncDefaultName(const char *name)
++{
++    if (hasNameOverride_ || !name || !name[0]) {
++        return;
++    }
++    strncpy(nodeName_, name, sizeof(nodeName_) - 1);
++    nodeName_[sizeof(nodeName_) - 1] = 0;
++}
++
 +void MeshCoreNode::sendSelfAdvert(bool flood)
 +{
-+    mesh::Packet *packet = createSelfAdvert(nodeName_);
++    mesh::Packet *packet = nullptr;
++    if (localPosition.latitude_i != 0 || localPosition.longitude_i != 0) {
++        double lat = static_cast<double>(localPosition.latitude_i) * 1e-7;
++        double lon = static_cast<double>(localPosition.longitude_i) * 1e-7;
++        packet = createSelfAdvert(nodeName_, lat, lon);
++    } else {
++        packet = createSelfAdvert(nodeName_);
++    }
++
 +    if (!packet) {
 +        return;
 +    }
@@ -242,6 +347,16 @@ index 0000000000000000000000000000000000000000..7dd3d4c975df364ea955add2f76814b2
 +    } else {
 +        sendZeroHop(packet);
 +    }
++}
++
++void MeshCoreNode::recordPendingAck(uint32_t ack, const ContactInfo &recipient)
++{
++    PendingAck &slot = pendingAcks_[nextAckSlot_];
++    slot.ack = ack;
++    slot.sentMs = millis();
++    memcpy(slot.pubKey, recipient.id.pub_key, PUB_KEY_SIZE);
++    slot.active = true;
++    nextAckSlot_ = static_cast<uint8_t>((nextAckSlot_ + 1) % kPendingAckSize);
 +}
 +
 +bool MeshCoreNode::enqueueMessage(const QueuedMessage &message)
@@ -253,6 +368,11 @@ index 0000000000000000000000000000000000000000..7dd3d4c975df364ea955add2f76814b2
 +    }
 +    messages_[msgHead_] = message;
 +    msgHead_ = next;
++
++    if (writer_) {
++        uint8_t push = PUSH_CODE_MSG_WAITING;
++        writer_(&push, 1);
++    }
 +    return true;
 +}
 +
@@ -268,21 +388,60 @@ index 0000000000000000000000000000000000000000..7dd3d4c975df364ea955add2f76814b2
 +
 +void MeshCoreNode::onDiscoveredContact(ContactInfo &contact, bool isNew, uint8_t pathLen, const uint8_t *path)
 +{
-+    (void)contact;
-+    (void)isNew;
 +    (void)pathLen;
 +    (void)path;
++    saveContacts();
++
++    if (!writer_) {
++        return;
++    }
++    if (isNew) {
++        writeContactFrame(PUSH_CODE_NEW_ADVERT, contact);
++    } else {
++        uint8_t push[1 + PUB_KEY_SIZE];
++        push[0] = PUSH_CODE_ADVERT;
++        memcpy(&push[1], contact.id.pub_key, PUB_KEY_SIZE);
++        writer_(push, sizeof(push));
++    }
 +}
 +
 +ContactInfo *MeshCoreNode::processAck(const uint8_t *data)
 +{
-+    (void)data;
-+    return nullptr;
++    if (!data) {
++        return nullptr;
++    }
++
++    uint32_t ack = 0;
++    memcpy(&ack, data, sizeof(ack));
++
++    for (uint8_t i = 0; i < kPendingAckSize; i++) {
++        PendingAck &slot = pendingAcks_[i];
++        if (slot.active && slot.ack == ack) {
++            slot.active = false;
++            uint32_t tripTimeMs = millis() - slot.sentMs;
++            if (writer_) {
++                uint8_t push[9];
++                push[0] = PUSH_CODE_SEND_CONFIRMED;
++                memcpy(&push[1], &ack, 4);
++                memcpy(&push[5], &tripTimeMs, 4);
++                writer_(push, sizeof(push));
++            }
++            return lookupContactByPubKey(slot.pubKey, PUB_KEY_SIZE);
++        }
++    }
++
++    return checkConnectionsAck(data);
 +}
 +
 +void MeshCoreNode::onContactPathUpdated(const ContactInfo &contact)
 +{
-+    (void)contact;
++    saveContacts();
++    if (writer_) {
++        uint8_t push[1 + PUB_KEY_SIZE];
++        push[0] = PUSH_CODE_PATH_UPDATED;
++        memcpy(&push[1], contact.id.pub_key, PUB_KEY_SIZE);
++        writer_(push, sizeof(push));
++    }
 +}
 +
 +void MeshCoreNode::onMessageRecv(const ContactInfo &contact, mesh::Packet *packet, uint32_t senderTimestamp,
@@ -415,21 +574,22 @@ index 0000000000000000000000000000000000000000..7dd3d4c975df364ea955add2f76814b2
 +
 +    frame[i++] = RESP_CODE_SELF_INFO;
 +    frame[i++] = ADV_TYPE_CHAT;
-+    frame[i++] = 20; // TX power
-+    frame[i++] = 22; // max TX power
++    int8_t txPower = meshtasticRadio_.getTxPower();
++    frame[i++] = static_cast<uint8_t>(txPower > 0 ? txPower : 20);
++    frame[i++] = 22; // SX1262 max TX power
 +
 +    memcpy(&frame[i], self_id.pub_key, PUB_KEY_SIZE);
 +    i += PUB_KEY_SIZE;
 +
-+    int32_t lat = 0;
-+    int32_t lon = 0;
++    int32_t lat = localPosition.latitude_i / 10;
++    int32_t lon = localPosition.longitude_i / 10;
 +    memcpy(&frame[i], &lat, 4);
 +    i += 4;
 +    memcpy(&frame[i], &lon, 4);
 +    i += 4;
 +
 +    frame[i++] = 0; // multi acks
-+    frame[i++] = 0; // advert location policy
++    frame[i++] = (lat != 0 || lon != 0) ? 1 : 0; // advert location policy
 +    frame[i++] = 0; // telemetry modes
 +    frame[i++] = 0; // manual add contacts
 +
@@ -519,6 +679,7 @@ index 0000000000000000000000000000000000000000..7dd3d4c975df364ea955add2f76814b2
 +
 +    ContactInfo contact;
 +    int slots = getTotalContactSlots();
++    uint32_t latestMod = 0;
 +    for (int idx = 0; idx < slots; idx++) {
 +        if (!getContactByIdx(idx, contact)) {
 +            break;
@@ -526,13 +687,15 @@ index 0000000000000000000000000000000000000000..7dd3d4c975df364ea955add2f76814b2
 +        if (contact.type == 0 || contact.name[0] == 0) {
 +            continue;
 +        }
++        if (contact.lastmod > latestMod) {
++            latestMod = contact.lastmod;
++        }
 +        writeContactFrame(RESP_CODE_CONTACT, contact);
 +    }
 +
 +    uint8_t end[5];
 +    end[0] = RESP_CODE_END_OF_CONTACTS;
-+    uint32_t lastMod = 0;
-+    memcpy(&end[1], &lastMod, 4);
++    memcpy(&end[1], &latestMod, 4);
 +    writer_(end, sizeof(end));
 +}
 +
@@ -596,6 +759,73 @@ index 0000000000000000000000000000000000000000..7dd3d4c975df364ea955add2f76814b2
 +    }
 +    memcpy(&frame[i], message.text, textLen);
 +    i += textLen;
++
++    writer_(frame, i);
++}
++
++void MeshCoreNode::writeStats(uint8_t statsType)
++{
++    uint8_t frame[32];
++    int i = 0;
++    frame[i++] = RESP_CODE_STATS;
++    frame[i++] = statsType;
++
++    switch (statsType) {
++    case STATS_TYPE_CORE: {
++        uint16_t battMv = powerStatus ? static_cast<uint16_t>(powerStatus->getBatteryVoltageMv()) : 0;
++        uint32_t uptimeSec = millis() / 1000;
++        uint16_t errFlags = getErrFlags();
++        uint8_t queueLen = static_cast<uint8_t>((msgHead_ + kMessageQueueSize - msgTail_) % kMessageQueueSize);
++        memcpy(&frame[i], &battMv, 2);
++        i += 2;
++        memcpy(&frame[i], &uptimeSec, 4);
++        i += 4;
++        memcpy(&frame[i], &errFlags, 2);
++        i += 2;
++        frame[i++] = queueLen;
++        break;
++    }
++    case STATS_TYPE_RADIO: {
++        int16_t noiseFloor = static_cast<int16_t>(meshtasticRadio_.getNoiseFloor());
++        int8_t lastRssi = static_cast<int8_t>(meshtasticRadio_.getLastRssi());
++        int8_t lastSnr4 = static_cast<int8_t>(meshtasticRadio_.getLastSnr() * 4.0f);
++        uint32_t txAirSec = getTotalAirTime() / 1000;
++        uint32_t rxAirSec = getReceiveAirTime() / 1000;
++        memcpy(&frame[i], &noiseFloor, 2);
++        i += 2;
++        frame[i++] = static_cast<uint8_t>(lastRssi);
++        frame[i++] = static_cast<uint8_t>(lastSnr4);
++        memcpy(&frame[i], &txAirSec, 4);
++        i += 4;
++        memcpy(&frame[i], &rxAirSec, 4);
++        i += 4;
++        break;
++    }
++    case STATS_TYPE_PACKETS: {
++        uint32_t recvTotal = getNumRecvFlood() + getNumRecvDirect();
++        uint32_t sentTotal = getNumSentFlood() + getNumSentDirect();
++        uint32_t sentFlood = getNumSentFlood();
++        uint32_t sentDirect = getNumSentDirect();
++        uint32_t recvFlood = getNumRecvFlood();
++        uint32_t recvDirect = getNumRecvDirect();
++        memcpy(&frame[i], &recvTotal, 4);
++        i += 4;
++        memcpy(&frame[i], &sentTotal, 4);
++        i += 4;
++        memcpy(&frame[i], &sentFlood, 4);
++        i += 4;
++        memcpy(&frame[i], &sentDirect, 4);
++        i += 4;
++        memcpy(&frame[i], &recvFlood, 4);
++        i += 4;
++        memcpy(&frame[i], &recvDirect, 4);
++        i += 4;
++        break;
++    }
++    default:
++        writeError(ERR_CODE_ILLEGAL_ARG);
++        return;
++    }
 +
 +    writer_(frame, i);
 +}
@@ -672,6 +902,114 @@ index 0000000000000000000000000000000000000000..7dd3d4c975df364ea955add2f76814b2
 +            } else {
 +                writeError(ERR_CODE_NOT_FOUND);
 +            }
++        } else {
++            writeError(ERR_CODE_ILLEGAL_ARG);
++        }
++        break;
++
++    case CMD_ADD_UPDATE_CONTACT:
++        if (len >= 1 + PUB_KEY_SIZE + 1 + 1 + 1 + MAX_PATH_SIZE + 32 + 4) {
++            ContactInfo contact = {};
++            int i = 1;
++            memcpy(contact.id.pub_key, &frame[i], PUB_KEY_SIZE);
++            i += PUB_KEY_SIZE;
++            contact.type = frame[i++];
++            contact.flags = frame[i++];
++            contact.out_path_len = frame[i++];
++            memcpy(contact.out_path, &frame[i], MAX_PATH_SIZE);
++            i += MAX_PATH_SIZE;
++            StrHelper::strzcpy(contact.name, reinterpret_cast<const char *>(&frame[i]), 32);
++            i += 32;
++            memcpy(&contact.last_advert_timestamp, &frame[i], 4);
++            i += 4;
++            if (len >= static_cast<size_t>(i + 8)) {
++                memcpy(&contact.gps_lat, &frame[i], 4);
++                i += 4;
++                memcpy(&contact.gps_lon, &frame[i], 4);
++                i += 4;
++            }
++            contact.lastmod = getRTCClock()->getCurrentTime();
++
++            ContactInfo *existing = lookupContactByPubKey(contact.id.pub_key, PUB_KEY_SIZE);
++            if (existing) {
++                *existing = contact;
++                saveContacts();
++                writeOK();
++            } else if (addContact(contact)) {
++                saveContacts();
++                writeOK();
++            } else {
++                writeError(ERR_CODE_TABLE_FULL);
++            }
++        } else {
++            writeError(ERR_CODE_ILLEGAL_ARG);
++        }
++        break;
++
++    case CMD_REMOVE_CONTACT:
++        if (len >= 1 + PUB_KEY_SIZE) {
++            ContactInfo *contact = lookupContactByPubKey(&frame[1], PUB_KEY_SIZE);
++            if (contact && removeContact(*contact)) {
++                saveContacts();
++                writeOK();
++            } else {
++                writeError(ERR_CODE_NOT_FOUND);
++            }
++        } else {
++            writeError(ERR_CODE_ILLEGAL_ARG);
++        }
++        break;
++
++    case CMD_RESET_PATH:
++        if (len >= 1 + PUB_KEY_SIZE) {
++            ContactInfo *contact = lookupContactByPubKey(&frame[1], PUB_KEY_SIZE);
++            if (contact) {
++                resetPathTo(*contact);
++                saveContacts();
++                writeOK();
++            } else {
++                writeError(ERR_CODE_NOT_FOUND);
++            }
++        } else {
++            writeError(ERR_CODE_ILLEGAL_ARG);
++        }
++        break;
++
++    case CMD_EXPORT_CONTACT:
++        if (len == 1) {
++            mesh::Packet *pkt = createSelfAdvert(nodeName_);
++            if (pkt) {
++                uint8_t reply[1 + MAX_TRANS_UNIT];
++                reply[0] = RESP_CODE_EXPORT_CONTACT;
++                uint8_t n = pkt->writeTo(&reply[1]);
++                releasePacket(pkt);
++                writer_(reply, 1 + n);
++            } else {
++                writeError(ERR_CODE_TABLE_FULL);
++            }
++        } else if (len >= 1 + PUB_KEY_SIZE) {
++            ContactInfo *contact = lookupContactByPubKey(&frame[1], PUB_KEY_SIZE);
++            if (contact) {
++                uint8_t reply[1 + MAX_TRANS_UNIT];
++                reply[0] = RESP_CODE_EXPORT_CONTACT;
++                uint8_t n = exportContact(*contact, &reply[1]);
++                if (n > 0) {
++                    writer_(reply, 1 + n);
++                } else {
++                    writeError(ERR_CODE_BAD_STATE);
++                }
++            } else {
++                writeError(ERR_CODE_NOT_FOUND);
++            }
++        } else {
++            writeError(ERR_CODE_ILLEGAL_ARG);
++        }
++        break;
++
++    case CMD_IMPORT_CONTACT:
++        if (len > 1 && importContact(&frame[1], static_cast<uint8_t>(len - 1))) {
++            saveContacts();
++            writeOK();
 +        } else {
 +            writeError(ERR_CODE_ILLEGAL_ARG);
 +        }
@@ -756,6 +1094,7 @@ index 0000000000000000000000000000000000000000..7dd3d4c975df364ea955add2f76814b2
 +            if (result == MSG_SEND_FAILED) {
 +                writeError(ERR_CODE_TABLE_FULL);
 +            } else {
++                recordPendingAck(expectedAck, *contact);
 +                uint8_t reply[10];
 +                reply[0] = RESP_CODE_SENT;
 +                reply[1] = result == MSG_SEND_SENT_FLOOD ? 1 : 0;
@@ -789,6 +1128,10 @@ index 0000000000000000000000000000000000000000..7dd3d4c975df364ea955add2f76814b2
 +        break;
 +    }
 +
++    case CMD_GET_STATS:
++        writeStats(len >= 2 ? frame[1] : STATS_TYPE_CORE);
++        break;
++
 +    case CMD_REBOOT:
 +        if (len >= 7 && memcmp(&frame[1], "reboot", 6) == 0) {
 +            ESP.restart();
@@ -799,7 +1142,7 @@ index 0000000000000000000000000000000000000000..7dd3d4c975df364ea955add2f76814b2
 +
 +    case CMD_SET_RADIO_PARAMS:
 +    case CMD_SET_RADIO_TX_POWER:
-+        // The PHY is shared with Meshtastic and configured by its radio settings.
++        // Replaced by shared PHY profile handling in the PHY series patch.
 +        writeError(ERR_CODE_UNSUPPORTED_CMD);
 +        break;
 +
@@ -814,10 +1157,10 @@ index 0000000000000000000000000000000000000000..7dd3d4c975df364ea955add2f76814b2
 +#endif // RAUMATA_DUAL_PROTOCOL
 diff --git a/src/raumata/MeshCoreNode.h b/src/raumata/MeshCoreNode.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..0e3e7166d0b84b18f4960ea19249f9c2da337b29
+index 0000000000000000000000000000000000000000..a88acda76153f402500a152ef26ed227918aa2db
 --- /dev/null
 +++ b/src/raumata/MeshCoreNode.h
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,115 @@
 +#pragma once
 +
 +#include <Arduino.h>
@@ -844,7 +1187,11 @@ index 0000000000000000000000000000000000000000..0e3e7166d0b84b18f4960ea19249f9c2
 +
 +    void handleCompanionFrame(const uint8_t *frame, size_t len);
 +    const char *nodeName() const { return nodeName_; }
++    bool hasNameOverride() const { return hasNameOverride_; }
 +    void setNodeName(const char *name);
++    void syncDefaultName(const char *name);
++    const mesh::LocalIdentity &identity() const { return self_id; }
++    void sendSelfAdvert(bool flood);
 +
 +  protected:
 +    // BaseChatMesh hooks
@@ -870,6 +1217,7 @@ index 0000000000000000000000000000000000000000..0e3e7166d0b84b18f4960ea19249f9c2
 +
 +  private:
 +    static constexpr uint8_t kMessageQueueSize = 8;
++    static constexpr uint8_t kPendingAckSize = 8;
 +    static constexpr uint32_t kAdvertIntervalMs = 15UL * 60UL * 1000UL;
 +
 +    struct QueuedMessage {
@@ -884,20 +1232,33 @@ index 0000000000000000000000000000000000000000..0e3e7166d0b84b18f4960ea19249f9c2
 +        char text[MAX_TEXT_LEN + 1];
 +    };
 +
++    struct PendingAck {
++        uint32_t ack;
++        uint32_t sentMs;
++        uint8_t pubKey[PUB_KEY_SIZE];
++        bool active;
++    };
++
 +    RadioInterface &meshtasticRadio_;
 +    FrameWriter writer_;
 +    char nodeName_[32];
++    bool hasNameOverride_ = false;
 +    QueuedMessage messages_[kMessageQueueSize];
 +    uint8_t msgHead_ = 0;
 +    uint8_t msgTail_ = 0;
++    PendingAck pendingAcks_[kPendingAckSize] = {};
++    uint8_t nextAckSlot_ = 0;
 +    uint32_t lastAdvertMs_ = 0;
 +
 +    void loadIdentity();
 +    void loadName();
 +    void loadChannels();
 +    void saveChannels();
++    void loadContacts();
++    void saveContacts();
 +    void saveName();
 +
++    void recordPendingAck(uint32_t ack, const ContactInfo &recipient);
 +    bool enqueueMessage(const QueuedMessage &message);
 +    bool popMessage(QueuedMessage &message);
 +
@@ -908,8 +1269,8 @@ index 0000000000000000000000000000000000000000..0e3e7166d0b84b18f4960ea19249f9c2
 +    void writeContacts();
 +    void writeChannel(uint8_t idx);
 +    void writeNextMessage();
++    void writeStats(uint8_t statsType);
 +    void writeContactFrame(uint8_t code, const ContactInfo &contact);
-+    void sendSelfAdvert(bool flood);
 +
 +    void handleCommand(uint8_t command, const uint8_t *frame, size_t len);
 +};
@@ -917,10 +1278,10 @@ index 0000000000000000000000000000000000000000..0e3e7166d0b84b18f4960ea19249f9c2
 +} // namespace raumata
 diff --git a/src/raumata/MeshCoreRadio.cpp b/src/raumata/MeshCoreRadio.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..213304a35a003d703e78b5816195e2953a19f67a
+index 0000000000000000000000000000000000000000..f342c8014ed77644d9dc983f28428cff8c91d1e0
 --- /dev/null
 +++ b/src/raumata/MeshCoreRadio.cpp
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,161 @@
 +#ifdef RAUMATA_DUAL_PROTOCOL
 +#include "MeshCoreRadio.h"
 +
@@ -1054,7 +1415,9 @@ index 0000000000000000000000000000000000000000..213304a35a003d703e78b5816195e295
 +
 +bool MeshCoreRadio::isReceiving()
 +{
-+    return !sending_ && pendingLen_ == 0 && !radio_.rawTransmitActive();
++    // MeshCore's Dispatcher::checkSend() checks isReceiving() to detect
++    // channel activity / busy state before transmitting.
++    return sending_ || pendingLen_ != 0 || radio_.isChannelBusy();
 +}
 +
 +void MeshCoreRadio::loop()

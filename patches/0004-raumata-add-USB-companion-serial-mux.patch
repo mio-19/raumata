@@ -1,12 +1,12 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Mio <mio@mio19.uk>
-Date: Thu, 22 Oct 2026 23:00:40 +1100
+Date: Fri, 23 Oct 2026 11:06:43 +1100
 Subject: [PATCH] raumata: add USB companion serial mux
 
-Parse both Meshtastic 0x94C3 framing and MeshCore '<' framing on the USB serial port. In dual builds SerialConsole becomes write-only while the mux owns reads; MeshCore mode suppresses Meshtastic debug output so companion apps see a clean frame stream.
+Parse both Meshtastic 0x94C3 framing and MeshCore '<' framing on the USB serial port. In dual builds SerialConsole becomes write-only while the mux owns reads; MeshCore mode suppresses Meshtastic debug output and prevents SerialConsole from dequeuing FromRadio packets meant for BLE.
 
 diff --git a/src/SerialConsole.cpp b/src/SerialConsole.cpp
-index e24aa3c57483eabf99a1c1946095843011c6053b..88028a4029bdb1f973397b11d8b049d38dca4800 100644
+index e24aa3c57483eabf99a1c1946095843011c6053b..6861726e4dd146094ba67173cd3f9b6f5b5e2f0f 100644
 --- a/src/SerialConsole.cpp
 +++ b/src/SerialConsole.cpp
 @@ -6,6 +6,10 @@
@@ -20,12 +20,15 @@ index e24aa3c57483eabf99a1c1946095843011c6053b..88028a4029bdb1f973397b11d8b049d3
  #if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
  #define IS_USB_SERIAL
  #ifdef SERIAL_HAS_ON_RECEIVE
-@@ -80,6 +84,12 @@ SerialConsole::SerialConsole() : StreamAPI(&Port), RedirectablePrint(&Port), con
+@@ -80,6 +84,15 @@ SerialConsole::SerialConsole() : StreamAPI(&Port), RedirectablePrint(&Port), con
  
  int32_t SerialConsole::runOnce()
  {
 +#ifdef RAUMATA_DUAL_PROTOCOL
 +    if (raumata::serialMuxActive()) {
++        if (meshCoreSerialMode) {
++            return 250;
++        }
 +        return runOnceWriteOnly();
 +    }
 +#endif
@@ -33,7 +36,17 @@ index e24aa3c57483eabf99a1c1946095843011c6053b..88028a4029bdb1f973397b11d8b049d3
  #ifdef HELTEC_MESH_SOLAR
      // After enabling the mesh solar serial port module configuration, command processing is handled by the serial port module.
      if (moduleConfig.serial.enabled && moduleConfig.serial.override_console_serial_port &&
-@@ -129,6 +139,7 @@ bool SerialConsole::handleToRadio(const uint8_t *buf, size_t len)
+@@ -118,6 +131,9 @@ void SerialConsole::rxInt()
+ // For the serial port we can't really detect if any client is on the other side, so instead just look for recent messages
+ bool SerialConsole::checkIsConnected()
+ {
++    if (meshCoreSerialMode) {
++        return false;
++    }
+     return Throttle::isWithinTimespanMs(lastContactMsec, SERIAL_CONNECTION_TIMEOUT);
+ }
+ 
+@@ -129,6 +145,7 @@ bool SerialConsole::handleToRadio(const uint8_t *buf, size_t len)
  {
      // only talk to the API once the configuration has been loaded and we're sure the serial port is not disabled.
      if (config.has_lora && config.security.serial_enabled) {
@@ -41,7 +54,7 @@ index e24aa3c57483eabf99a1c1946095843011c6053b..88028a4029bdb1f973397b11d8b049d3
          // Switch to protobufs for log messages
          usingProtobufs = true;
          canWrite = true;
-@@ -139,8 +150,18 @@ bool SerialConsole::handleToRadio(const uint8_t *buf, size_t len)
+@@ -139,8 +156,18 @@ bool SerialConsole::handleToRadio(const uint8_t *buf, size_t len)
      }
  }
  
@@ -61,21 +74,23 @@ index e24aa3c57483eabf99a1c1946095843011c6053b..88028a4029bdb1f973397b11d8b049d3
          meshtastic_LogRecord_Level ll = RedirectablePrint::getLogLevel(logLevel);
          auto thread = concurrency::OSThread::currentThread;
 diff --git a/src/SerialConsole.h b/src/SerialConsole.h
-index 98577e4bcedbd0f57c3a846814a25e5a9c7f6d51..c35f8ba993c81a18491b92a10a72100b9b472a2d 100644
+index 98577e4bcedbd0f57c3a846814a25e5a9c7f6d51..646132aaca72b88ef4017bcdb2c17632be1fcfb6 100644
 --- a/src/SerialConsole.h
 +++ b/src/SerialConsole.h
-@@ -34,6 +34,10 @@ class SerialConsole : public StreamAPI, public RedirectablePrint, private concur
+@@ -34,6 +34,12 @@ class SerialConsole : public StreamAPI, public RedirectablePrint, private concur
      void flush();
      void rxInt();
  
 +    /// MeshCore companion mode suppresses debug text and FromRadio writes so the
-+    /// serial port can carry MeshCore's framed protocol.
++    /// serial port can carry MeshCore's framed protocol without stealing packets
++    /// from the BLE PhoneAPI.
 +    void setMeshCoreSerialMode(bool enabled);
++    bool isMeshCoreSerialMode() const { return meshCoreSerialMode; }
 +
    protected:
      /// Check the current underlying physical link to see if the client is currently connected
      virtual bool checkIsConnected() override;
-@@ -42,6 +46,9 @@ class SerialConsole : public StreamAPI, public RedirectablePrint, private concur
+@@ -42,6 +48,9 @@ class SerialConsole : public StreamAPI, public RedirectablePrint, private concur
  
      /// Possibly switch to protobufs if we see a valid protobuf message
      virtual void log_to_serial(const char *logLevel, const char *format, va_list arg);
@@ -85,6 +100,53 @@ index 98577e4bcedbd0f57c3a846814a25e5a9c7f6d51..c35f8ba993c81a18491b92a10a72100b
  };
  
  // A simple wrapper to allow non class aware code write to the console
+diff --git a/src/main.cpp b/src/main.cpp
+index 084dd29146a50f9b8aca7c3f1182e3ca07f75db6..9560295b482accb5f989a07a3d4d12a2468d6d5c 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -34,6 +34,9 @@
+ #include "main.h"
+ #include "mesh/generated/meshtastic/config.pb.h"
+ #include "meshUtils.h"
++#ifdef RAUMATA_DUAL_PROTOCOL
++#include "raumata/RaumataProtocol.h"
++#endif
+ #include "modules/Modules.h"
+ #include "sleep.h"
+ #include "target_specific.h"
+@@ -987,6 +990,9 @@ void setup()
+ #endif
+ 
+     auto rIf = initLoRa();
++#ifdef RAUMATA_DUAL_PROTOCOL
++    RadioInterface *raumataRadio = rIf.get();
++#endif
+ 
+     lateInitVariant(); // Do board specific init (see extra_variants/README.md for documentation)
+ 
+@@ -1043,6 +1049,12 @@ void setup()
+         router->addInterface(std::move(rIf));
+     }
+ 
++#ifdef RAUMATA_DUAL_PROTOCOL
++    if (raumataRadio) {
++        raumata::init(raumataRadio);
++    }
++#endif
++
+     // This must be _after_ service.init because we need our preferences loaded from flash to have proper timeout values
+     PowerFSM_setup(); // we will transition to ON in a couple of seconds, FIXME, only do this for cold boots, not waking from SDS
+     powerFSMthread = new PowerFSMThread();
+@@ -1181,6 +1193,9 @@ void loop()
+ #endif
+ 
+     service->loop();
++#ifdef RAUMATA_DUAL_PROTOCOL
++    raumata::loop();
++#endif
+ #if !MESHTASTIC_EXCLUDE_INPUTBROKER && defined(HAS_FREE_RTOS) && !defined(ARCH_RP2040)
+     if (inputBroker)
+         inputBroker->processInputEventQueue();
 diff --git a/src/mesh/StreamAPI.cpp b/src/mesh/StreamAPI.cpp
 index 2c336287714b9bec9a79b9839953cb002542164f..0d99d9642e81c8d4b57fd8ea5e38593c0a7a12d8 100644
 --- a/src/mesh/StreamAPI.cpp
@@ -120,10 +182,10 @@ index d3ad9ba794d353847f1842ae84ace31f72694865..49059e58369b32ea11ae39a325313a98
  
 diff --git a/src/raumata/CompanionSerial.cpp b/src/raumata/CompanionSerial.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..8531152a516307b669e93124e387de120f088299
+index 0000000000000000000000000000000000000000..3330454ba1c874fc324d7a64be99fecf436ab5a1
 --- /dev/null
 +++ b/src/raumata/CompanionSerial.cpp
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,128 @@
 +#ifdef RAUMATA_DUAL_PROTOCOL
 +#include "CompanionSerial.h"
 +
@@ -140,6 +202,11 @@ index 0000000000000000000000000000000000000000..8531152a516307b669e93124e387de12
 +    state_ = IDLE;
 +    frameLen_ = 0;
 +    framePos_ = 0;
++#if defined(RAUMATA_COMPANION_MODE_BLE_USB) && RAUMATA_COMPANION_MODE_BLE_USB
++    // Dedicate USB to MeshCore by default so Meshtastic BLE + MeshCore USB can
++    // operate simultaneously without serial log or FromRadio contention.
++    setMeshCoreMode(true);
++#endif
 +}
 +
 +void CompanionSerial::loop()

@@ -1,74 +1,28 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Mio <mio@mio19.uk>
-Date: Thu, 22 Oct 2026 23:00:40 +1100
+Date: Fri, 23 Oct 2026 11:07:11 +1100
 Subject: [PATCH] build: enable dual protocol on Heltec V3
 
-Add the heltec-v3-dual environment and start the MeshCore node after Meshtastic's radio is initialized. MeshCore shares the configured Meshtastic PHY, including frequency, bandwidth, spread factor, coding rate, sync word, and preamble.
+Add the heltec-v3-dual PlatformIO environment with RAUMATA_DUAL_PROTOCOL, RAUMATA_COMPANION_MODE_BLE_USB, the vendored MeshCore headers, and the Crypto/base64 dependencies.
 
-diff --git a/src/main.cpp b/src/main.cpp
-index 084dd29146a50f9b8aca7c3f1182e3ca07f75db6..9560295b482accb5f989a07a3d4d12a2468d6d5c 100644
---- a/src/main.cpp
-+++ b/src/main.cpp
-@@ -34,6 +34,9 @@
- #include "main.h"
- #include "mesh/generated/meshtastic/config.pb.h"
- #include "meshUtils.h"
-+#ifdef RAUMATA_DUAL_PROTOCOL
-+#include "raumata/RaumataProtocol.h"
-+#endif
- #include "modules/Modules.h"
- #include "sleep.h"
- #include "target_specific.h"
-@@ -987,6 +990,9 @@ void setup()
- #endif
- 
-     auto rIf = initLoRa();
-+#ifdef RAUMATA_DUAL_PROTOCOL
-+    RadioInterface *raumataRadio = rIf.get();
-+#endif
- 
-     lateInitVariant(); // Do board specific init (see extra_variants/README.md for documentation)
- 
-@@ -1043,6 +1049,12 @@ void setup()
-         router->addInterface(std::move(rIf));
-     }
- 
-+#ifdef RAUMATA_DUAL_PROTOCOL
-+    if (raumataRadio) {
-+        raumata::init(raumataRadio);
-+    }
-+#endif
-+
-     // This must be _after_ service.init because we need our preferences loaded from flash to have proper timeout values
-     PowerFSM_setup(); // we will transition to ON in a couple of seconds, FIXME, only do this for cold boots, not waking from SDS
-     powerFSMthread = new PowerFSMThread();
-@@ -1181,6 +1193,9 @@ void loop()
- #endif
- 
-     service->loop();
-+#ifdef RAUMATA_DUAL_PROTOCOL
-+    raumata::loop();
-+#endif
- #if !MESHTASTIC_EXCLUDE_INPUTBROKER && defined(HAS_FREE_RTOS) && !defined(ARCH_RP2040)
-     if (inputBroker)
-         inputBroker->processInputEventQueue();
 diff --git a/variants/esp32s3/heltec_v3/platformio.ini b/variants/esp32s3/heltec_v3/platformio.ini
-index 2f53c87563f741fbfb0dc4c55010a70001e5ba88..9b1e35b3624ca5d3135f6b9f83a50357d7840ee2 100644
+index 2f53c87563f741fbfb0dc4c55010a70001e5ba88..cbaabf3952bf5d6f8427a1a46a447030fc4bbc3f 100644
 --- a/variants/esp32s3/heltec_v3/platformio.ini
 +++ b/variants/esp32s3/heltec_v3/platformio.ini
-@@ -18,3 +18,20 @@ build_flags =
+@@ -18,3 +18,21 @@ build_flags =
    ${esp32s3_base.build_flags}
    -D HELTEC_V3
    -I variants/esp32s3/heltec_v3
 +
 +; Raumata dual-protocol firmware: Meshtastic + MeshCore on one SX1262.
-+; MeshCore uses the same LoRa PHY as Meshtastic; frames are distinguished by
-+; the RAUM transport tag.
++; MeshCore and Meshtastic share one selectable PHY profile; frames are
++; distinguished on air by the RAUM transport tag.
 +[env:heltec-v3-dual]
 +extends = env:heltec-v3
 +build_flags =
 +  ${env:heltec-v3.build_flags}
 +  -D RAUMATA_DUAL_PROTOCOL=1
++  -D RAUMATA_COMPANION_MODE_BLE_USB=1
 +  -D MAX_CONTACTS=32
 +  -D MAX_GROUP_CHANNELS=8
 +  -I lib/meshcore/src

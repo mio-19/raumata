@@ -1,6 +1,6 @@
 # Shared PHY profiles and preset selection
 
-Status: design for the next PHY series.
+Status: implemented in `0002-radio-add-raw-frame-hook-and-shared-ownership.patch` and `0006-raumata-add-shared-phy-profiles-and-preset-selection.patch`.
 
 The radio stays in **one physical configuration** continuously. There is no
 per-protocol retuning and no time slicing. That one configuration is a

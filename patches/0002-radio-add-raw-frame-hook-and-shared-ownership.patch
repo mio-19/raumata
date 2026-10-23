@@ -1,12 +1,14 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Mio <mio@mio19.uk>
-Date: Thu, 22 Oct 2026 23:00:40 +1100
+Date: Fri, 23 Oct 2026 11:01:41 +1100
 Subject: [PATCH] radio: add raw frame hook and shared ownership
 
-Add a raw packet sink and raw transmit path to RadioInterface and RadioLibInterface. MeshCore frames can be consumed before the Meshtastic router sees them, and MeshCore transmits are serialized against the Meshtastic TX queue with a mutex and owner flags.
+Add a RawPacketHandler hook and a raw transmit path to RadioLibInterface so a second protocol stack can share the SX126x without going through the Meshtastic PacketHeader parser.
+
+Both stacks serialize transmit access through rawRadioMutex and the sendingPacket/rawTxActive flags, check active receive state before raw transmit, log raw TX airtime, and expose mutable syncWord/preambleLength for shared PHY profiles.
 
 diff --git a/src/mesh/RadioInterface.h b/src/mesh/RadioInterface.h
-index f0b005e3e3070c5a9b1f12eb460c8de923fb97cf..c596fe7de726578521a32c3e68bcdf2cc504b257 100644
+index f0b005e3e3070c5a9b1f12eb460c8de923fb97cf..0ee89a70590a2c8fad8451655ae05c40442eae22 100644
 --- a/src/mesh/RadioInterface.h
 +++ b/src/mesh/RadioInterface.h
 @@ -67,6 +67,18 @@ typedef struct {
@@ -28,14 +30,23 @@ index f0b005e3e3070c5a9b1f12eb460c8de923fb97cf..c596fe7de726578521a32c3e68bcdf2c
  /**
   * Basic operations all radio chipsets must implement.
   *
-@@ -231,6 +243,26 @@ class RadioInterface
+@@ -231,6 +243,36 @@ class RadioInterface
       */
      [[nodiscard]] virtual float getFreq();
  
-+    /// Current modem parameters, exposed for the MeshCore companion self-info frame.
++    /// Current modem parameters, exposed for the MeshCore companion self-info frame and shared PHY profiles.
 +    [[nodiscard]] virtual float getBandwidthKHz() const { return bw; }
 +    [[nodiscard]] virtual uint8_t getSpreadFactorValue() const { return sf; }
 +    [[nodiscard]] virtual uint8_t getCodingRateValue() const { return cr; }
++    [[nodiscard]] virtual int8_t getTxPower() const { return power; }
++    [[nodiscard]] virtual uint8_t getSyncWord() const { return 0x2b; }
++    virtual void setSyncWord(uint8_t sw) { (void)sw; }
++    [[nodiscard]] uint16_t getPreambleLength() const { return preambleLength; }
++    void setPreambleLength(uint16_t len)
++    {
++        if (len > 0)
++            preambleLength = len;
++    }
 +
 +    /// Raw-frame access used by the dual-protocol MeshCore stack.
 +    virtual void setRawPacketHandler(RawPacketHandler *handler) { (void)handler; }
@@ -48,6 +59,7 @@ index f0b005e3e3070c5a9b1f12eb460c8de923fb97cf..c596fe7de726578521a32c3e68bcdf2c
 +    virtual bool rawTransmitDone() const { return false; }
 +    virtual void rawTransmitFinished() {}
 +    virtual bool rawTransmitActive() const { return false; }
++    virtual bool isChannelBusy() { return false; }
 +    virtual int32_t getNoiseFloor() { return -120; }
 +    virtual float getLastRssi() const { return 0; }
 +    virtual float getLastSnr() const { return 0; }
@@ -56,7 +68,7 @@ index f0b005e3e3070c5a9b1f12eb460c8de923fb97cf..c596fe7de726578521a32c3e68bcdf2c
      virtual bool isIRQPending() { return false; }
  
 diff --git a/src/mesh/RadioLibInterface.cpp b/src/mesh/RadioLibInterface.cpp
-index 335e76a3bc74155eab7eb6946b16f0bc504852ca..656126c30f1a93e46600c3f45425b38c92c3158a 100644
+index 335e76a3bc74155eab7eb6946b16f0bc504852ca..b53a7e1bc9c0e470b96e791cd069aabb06547912 100644
 --- a/src/mesh/RadioLibInterface.cpp
 +++ b/src/mesh/RadioLibInterface.cpp
 @@ -94,7 +94,7 @@ bool RadioLibInterface::canSendImmediately()
@@ -94,7 +106,7 @@ index 335e76a3bc74155eab7eb6946b16f0bc504852ca..656126c30f1a93e46600c3f45425b38c
  
      switch (notification) {
      case ISR_TX:
-@@ -375,6 +376,12 @@ void RadioLibInterface::onNotify(uint32_t notification)
+@@ -375,6 +376,11 @@ void RadioLibInterface::onNotify(uint32_t notification)
          setTransmitDelay();
          break;
      case TRANSMIT_DELAY_COMPLETED:
@@ -103,17 +115,21 @@ index 335e76a3bc74155eab7eb6946b16f0bc504852ca..656126c30f1a93e46600c3f45425b38c
 +            setTransmitDelay();
 +            break;
 +        }
-+
  
          // If we are not currently in receive mode, then restart the random delay (this can happen if the main thread
          // has placed the unit into standby)  FIXME, how will this work if the chipset is in sleep mode?
-@@ -496,6 +503,13 @@ bool RadioLibInterface::removePendingTXPacket(NodeNum from, PacketId id, uint32_
+@@ -496,6 +502,18 @@ bool RadioLibInterface::removePendingTXPacket(NodeNum from, PacketId id, uint32_
  
  void RadioLibInterface::handleTransmitInterrupt()
  {
 +    if (rawTxActive.load(std::memory_order_acquire)) {
 +        rawTxActive.store(false, std::memory_order_release);
 +        rawTxDone.store(true, std::memory_order_release);
++        if (airTime && rawTxBytes > 0) {
++            uint32_t xmitMsec = getPacketTime(rawTxBytes, false);
++            airTime->logAirtime(TX_LOG, xmitMsec);
++        }
++        rawTxBytes = 0;
 +        powerMon->clearState(meshtastic_PowerMon_State_Lora_TXOn);
 +        return;
 +    }
@@ -121,7 +137,7 @@ index 335e76a3bc74155eab7eb6946b16f0bc504852ca..656126c30f1a93e46600c3f45425b38c
      // This can be null if we forced the device to enter standby mode.  In that case
      // ignore the transmit interrupt
      if (sendingPacket)
-@@ -569,6 +583,18 @@ void RadioLibInterface::handleReceiveInterrupt()
+@@ -569,6 +587,18 @@ void RadioLibInterface::handleReceiveInterrupt()
          airTime->logAirtime(RX_ALL_LOG, rxMsec);
  
      } else {
@@ -140,7 +156,7 @@ index 335e76a3bc74155eab7eb6946b16f0bc504852ca..656126c30f1a93e46600c3f45425b38c
          // Skip the 4 headers that are at the beginning of the rxBuf
          int32_t payloadLen = length - sizeof(PacketHeader);
  
-@@ -664,6 +690,35 @@ void RadioLibInterface::setStandby()
+@@ -664,6 +694,38 @@ void RadioLibInterface::setStandby()
      powerMon->clearState(meshtastic_PowerMon_State_Lora_TXOn);
  }
  
@@ -149,19 +165,22 @@ index 335e76a3bc74155eab7eb6946b16f0bc504852ca..656126c30f1a93e46600c3f45425b38c
 +{
 +    std::lock_guard<std::mutex> rawLock(rawRadioMutex);
 +
-+    if (data == nullptr || len == 0 || len > MAX_LORA_PAYLOAD_LEN || sendingPacket != nullptr ||
-+        rawTxActive.load(std::memory_order_acquire)) {
++    if (disabled || !config.lora.tx_enabled || data == nullptr || len == 0 || len > MAX_LORA_PAYLOAD_LEN ||
++        sendingPacket != nullptr || rawTxActive.load(std::memory_order_acquire) ||
++        (isReceiving && isActivelyReceiving())) {
 +        return false;
 +    }
 +
 +    configHardwareForSend();
 +
++    rawTxBytes = static_cast<uint16_t>(len);
 +    rawTxActive.store(true, std::memory_order_release);
 +    rawTxDone.store(false, std::memory_order_release);
 +
 +    int res = iface->startTransmit(const_cast<uint8_t *>(data), len);
 +    if (res != RADIOLIB_ERR_NONE) {
 +        LOG_ERROR("raw startTransmit failed, error=%d", res);
++        rawTxBytes = 0;
 +        rawTxActive.store(false, std::memory_order_release);
 +        powerMon->clearState(meshtastic_PowerMon_State_Lora_TXOn);
 +        startReceive();
@@ -177,7 +196,7 @@ index 335e76a3bc74155eab7eb6946b16f0bc504852ca..656126c30f1a93e46600c3f45425b38c
  bool RadioLibInterface::startSend(meshtastic_MeshPacket *txp)
  {
 diff --git a/src/mesh/RadioLibInterface.h b/src/mesh/RadioLibInterface.h
-index cfbfbe1b5856172019735e378ed3d2fd95644c9e..1514413697628b9813ea264171a73cabda0d1cd0 100644
+index cfbfbe1b5856172019735e378ed3d2fd95644c9e..423f19082676bd2c0a53b29b083876826dabb381 100644
 --- a/src/mesh/RadioLibInterface.h
 +++ b/src/mesh/RadioLibInterface.h
 @@ -7,6 +7,9 @@
@@ -190,6 +209,15 @@ index cfbfbe1b5856172019735e378ed3d2fd95644c9e..1514413697628b9813ea264171a73cab
  // ESP32 has special rules about ISR code
  #ifdef ARDUINO_ARCH_ESP32
  #define INTERRUPT_ATTR IRAM_ATTR
+@@ -81,7 +84,7 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
+      * We now use 0x2b (so that someday we can possibly use NOT 2b - because that would be funny pun).  We will be staying with
+      * this code for a long time.
+      */
+-    const uint8_t syncWord = 0x2b;
++    uint8_t syncWord = 0x2b;
+ 
+     float currentLimit = 100; // 100mA OCP - Should be acceptable for RFM95/SX127x chipset.
+ 
 @@ -128,7 +131,7 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
       * Get the current calculated noise floor in dBm
       * Returns -120 dBm if not yet calibrated
@@ -199,29 +227,38 @@ index cfbfbe1b5856172019735e378ed3d2fd95644c9e..1514413697628b9813ea264171a73cab
  
      /**
       * Calculate the average noise floor from collected samples
-@@ -197,6 +200,15 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
+@@ -197,6 +200,23 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
       */
      virtual bool isSending();
  
++    uint8_t getSyncWord() const override { return syncWord; }
++    void setSyncWord(uint8_t sw) override { syncWord = sw; }
++
 +    /// Raw-frame access used by the dual-protocol MeshCore stack.
 +    void setRawPacketHandler(RawPacketHandler *handler) override { rawPacketHandler = handler; }
 +    bool rawTransmit(const uint8_t *data, size_t len) override;
 +    bool rawTransmitDone() const override { return rawTxDone.load(std::memory_order_acquire); }
 +    void rawTransmitFinished() override { rawTxDone.store(false, std::memory_order_release); }
 +    bool rawTransmitActive() const override { return rawTxActive.load(std::memory_order_acquire); }
++    bool isChannelBusy() override
++    {
++        return sendingPacket != nullptr || rawTxActive.load(std::memory_order_acquire) ||
++               (isReceiving && isActivelyReceiving());
++    }
 +    float getLastRssi() const override { return lastRawRssi; }
 +    float getLastSnr() const override { return lastRawSnr; }
 +
      /** Attempt to cancel a previously sent packet.  Returns true if a packet was found we could cancel */
      virtual bool cancelSending(NodeNum from, PacketId id) override;
  
-@@ -232,6 +244,13 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
+@@ -232,6 +252,14 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
      bool randomBytes(uint8_t *buffer, size_t length);
  
    private:
 +    RawPacketHandler *rawPacketHandler = nullptr;
 +    std::atomic<bool> rawTxActive{false};
 +    std::atomic<bool> rawTxDone{false};
++    uint16_t rawTxBytes = 0;
 +    volatile float lastRawSnr = 0;
 +    volatile float lastRawRssi = 0;
 +    std::mutex rawRadioMutex;

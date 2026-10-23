@@ -1,6 +1,6 @@
 # Dual identity, presence, and simultaneous companion access
 
-Status: design for the next patch series.
+Status: implemented in `0004-raumata-add-usb-companion-serial-mux.patch` and `0007-raumata-add-dual-identity-link-and-presence-schedule.patch`.
 
 The current six-patch series already runs Meshtastic and MeshCore on one
 SX1262 with a shared PHY, gives the MeshCore side its own ed25519 identity,

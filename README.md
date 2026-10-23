@@ -17,28 +17,34 @@ The first series turns the Heltec V3 firmware into a shared-PHY dual-protocol
 node:
 
 - Meshtastic and [MeshCore](https://github.com/ripplebiz/MeshCore) both run on
-  the same SX1262 and the same LoRa PHY.
+  the same SX1262 and the same selectable LoRa PHY profile (Meshtastic preset,
+  MeshCore preset, dual preset, or custom PHY).
 - MeshCore frames carry the four-byte `RAUM` transport tag so they can be
   demultiplexed from Meshtastic frames on receive.
-- MeshCore's identity and channels persist in NVS; the node advertises and
-  supports direct/group text.
+- MeshCore's identity, contacts, channels, and identity-link record persist in
+  NVS; the node staggers presence adverts across both meshes and supports
+  direct/group text, contact import/export, custom variables, and telemetry stats.
 - A USB-serial mux serves both Meshtastic's PhoneAPI and the MeshCore companion
-  protocol, so MeshCore apps can connect to the same port.
+  protocol (or dedicates USB to MeshCore when Meshtastic uses BLE in
+  `RAUMATA_COMPANION_MODE_BLE_USB`).
 
-Because one radio has one demodulator, the MeshCore side uses Meshtastic's
-frequency/BW/SF/CR/sync-word settings. It reaches MeshCore peers configured to
-the same PHY, **not** the standard MeshCore 916.575 MHz/SF7 preset. Both stacks
-also share one airtime budget. The patched tree contains
+Because one radio has one demodulator, both stacks share the active `PhyProfile`
+(frequency, bandwidth, spreading factor, coding rate, sync word, preamble, and
+TX power) as well as one airtime budget. The patched tree contains
 `docs/raumata-dual-protocol.md` with the design and limitations.
 
 Build the dual-protocol image from the working tree:
 
 ```sh
 cd work/firmware
-pio run -e heltec-v3-dual
+pio run -e heltec-v3-dual      # Heltec V3
+pio run -e t-deck-plus-dual    # LILYGO T-Deck Plus (with built-in L76K GPS)
+pio run -e t-deck-dual         # LILYGO T-Deck (BaseUI)
+pio run -e t-deck-tft-dual     # LILYGO T-Deck / T-Deck Plus (Meshtastic UI / LVGL)
 ```
 
-`heltec-v3-dual` is the only build target verified by this series.
+`heltec-v3-dual` and `t-deck-plus-dual` (`t-deck-dual`, `t-deck-tft-dual`) are
+the supported dual-protocol build targets in this series.
 
 ## Current series: Android MeshCore companion
 
@@ -175,6 +181,7 @@ To update only the base without exporting patches, add `--no-rebuild`.
 | `scripts/apply-android.sh` | Reset `work/android` to the base and apply patches.  |
 | `scripts/rebuild-android-patches.sh` | Export Android commits to `patches/android/`. |
 | `scripts/verify-android.sh`| Check the Android series applies cleanly.            |
+| `scripts/upstream-android.sh` | Rebase the Android series onto a newer release.   |
 
 The upstream base is pinned by both tag and commit in `upstream.conf`; changing
 it by hand works too, but `scripts/upstream.sh` also rebases the series.
