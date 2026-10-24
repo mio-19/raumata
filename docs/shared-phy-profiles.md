@@ -15,6 +15,13 @@ The operating mode chooses which family supplies that configuration:
 | Both on a Meshtastic profile | `shared-meshtastic` | A Meshtastic preset | Both stacks advertise. About 50% / 50% airtime. |
 | Both on a MeshCore profile | `shared-meshcore` | A MeshCore preset | Both stacks advertise. About 50% / 50% airtime. |
 
+Each stack's share is a portion of the regional duty cycle, measured over the
+last hour. Background traffic is dropped once that share is used. Text,
+routing, and admin messages are still sent. A MeshCore companion can set the
+advert position with `CMD_SET_ADVERT_COORDS` (latitude and longitude in
+millionths of a degree); otherwise the advert uses the Meshtastic local
+position.
+
 The mode is stored in NVS (`raumata/mode`) with the last preset chosen for each
 family, so switching back restores it. A profile from the other family is
 rejected. Stock peers of the selected family hear the node; stock peers of the

@@ -214,8 +214,10 @@ Add a shared airtime budget:
 - Reserve a share for each protocol from the operating mode: 90/10 when one
   protocol is primary, 50/50 when both are active. The secondary protocol's
   periodic presence is off in a "mainly" mode.
-- Classify traffic: control/ACK > text > position > telemetry > adverts.
-  Defer or drop adverts/telemetry first when the budget is exhausted.
+- Classify traffic: text, routing, and admin stay. NodeInfo, position,
+  telemetry, and adverts are dropped first when a stack has used its hourly
+  share. In mainly-MeshCore mode those Meshtastic background packets stay off
+  even when they are marked reliable.
 - MeshCore's `Dispatcher` already has a tx budget; set its
   `getAirtimeBudgetFactor()` so its share matches the reservation, and make
   the radio arbiter account for the actual airtime of both stacks.
