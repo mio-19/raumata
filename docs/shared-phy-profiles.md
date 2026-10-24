@@ -1,6 +1,6 @@
 # Shared PHY profiles and preset selection
 
-Status: profiles are implemented in `0002-radio-add-raw-frame-hook-and-shared-ownership.patch` and `0006-raumata-add-shared-phy-profiles-and-preset-selection.patch`. Operating modes are implemented in `0011-raumata-choose-a-native-profile-and-which-protocol-o.patch`.
+Status: profiles are implemented in `0002-radio-add-raw-frame-hook-and-shared-ownership.patch` and `0006-raumata-add-shared-phy-profiles-and-preset-selection.patch`. Operating modes are implemented in `0011-raumata-choose-a-native-profile-and-which-protocol-o.patch`. The companion is MeshCore's `MyMesh` as of `0013-raumata-run-MeshCore-s-companion-on-the-shared-radio.patch`.
 
 The radio stays in **one physical configuration** continuously. There is no
 per-protocol retuning and no time slicing. That one configuration is a
