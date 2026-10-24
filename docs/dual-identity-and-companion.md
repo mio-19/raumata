@@ -7,8 +7,10 @@ split; see [shared-phy-profiles.md](./shared-phy-profiles.md).
 The series runs Meshtastic and MeshCore on one SX1262, gives the MeshCore side
 its own ed25519 identity, links that identity to the Meshtastic node, staggers
 presence, and multiplexes Meshtastic and MeshCore framing on USB serial.
-MeshCore BLE and TCP companions, and the cross-protocol bridge, are still out
-of this series.
+MeshCore BLE and TCP companions are still out of this series. The two
+protocols stay separate: a MeshCore contact is never inserted into the
+Meshtastic node list, and a Meshtastic node is never inserted into the
+MeshCore contact list.
 
 > The radio uses one native physical configuration, chosen by the operating
 > mode: a Meshtastic preset or a MeshCore preset. See
@@ -25,14 +27,13 @@ of this series.
 
 ## 2. Non-goals for the first identity/companion series
 
-- Transparent bridging of every packet between the two meshes.
+- Copying nodes or messages from one protocol into the other. MeshCore
+  contacts stay in the MeshCore app. Meshtastic nodes stay in the Meshtastic
+  app.
 - MeshCore BLE companion in the first step.
 - Proving to a remote node that the two identities are the same device.
 - Changing Meshtastic's or MeshCore's on-air formats beyond the existing
   `RAUM` transport tag.
-
-Cross-protocol node visibility (MeshCore contacts appearing in the Meshtastic
-app, and vice versa) is a separate optional bridge described in section 6.
 
 ## 3. Current identity state
 
@@ -83,7 +84,7 @@ Advantages:
 - No crypto coupling; a Meshtastic key reset does not silently change the
   MeshCore identity.
 - Works with unmodified Meshtastic and MeshCore apps.
-- The mapping is available to custom clients and to a future bridge.
+- The mapping is local. Each app still shows only its own protocol.
 
 Disadvantage:
 
@@ -232,60 +233,15 @@ Add a shared airtime budget:
 
 ### 5.4 What “appear in both” means
 
-- **Device appears in both node lists (in scope):** the Meshtastic app sees
-  the device's Meshtastic NodeInfo; the MeshCore app sees the device's
-  MeshCore advert. Same name, optional link record.
-- **MeshCore nodes appear in the Meshtastic app, and vice versa (optional
-  bridge):** this requires identity shadowing and message translation; see
-  section 6. It is not a side effect of running both stacks.
+The same physical device announces itself on each mesh with that mesh's own
+identity. The Meshtastic app sees this device's Meshtastic NodeInfo. The
+MeshCore app sees this device's MeshCore advert. Other MeshCore contacts stay
+out of the Meshtastic app. Other Meshtastic nodes stay out of the MeshCore
+contact list. Messages are not translated from one protocol into the other.
 
-## 6. Optional bridge mode: cross-protocol node visibility
+## 6. Simultaneous companion access
 
-### 6.1 MeshCore to Meshtastic
-
-- Allocate a synthetic Meshtastic NodeNum for each MeshCore contact:
-  `0x80000000 | (first 31 bits of SHA256("raumata-msh-shadow" || mc_pubkey))`.
-- Store the mapping in a bounded table.
-- Inject a synthetic `NodeInfo`/`User` into the Meshtastic NodeDB and
-  PhoneAPI so the app shows the contact. Prefer local injection only; do not
-  flood synthetic NodeInfo over the Meshtastic air unless a dedicated channel
-  and airtime budget are configured.
-- For text, create a Meshtastic text packet with `from` = synthetic NodeNum
-  on a dedicated channel, or expose a custom `PortNum` and let a custom app
-  render it. Standard Meshtastic apps may treat injected packets as normal
-  channel traffic; this needs careful testing and loop prevention.
-
-### 6.2 Meshtastic to MeshCore
-
-MeshCore direct messages require an ed25519 keypair and a shared secret. A
-bridge cannot sign as an arbitrary Meshtastic node. Two options:
-
-1. **Single bridge contact:** all Meshtastic traffic appears from the bridge's
-   MeshCore identity, with a `[MSH:<node>]` prefix in the text. Simple and
-   honest, but Meshtastic nodes are not separate MeshCore contacts.
-2. **Shadow MeshCore identities:** derive a deterministic ed25519 seed per
-   Meshtastic NodeNum from a bridge secret:
-   `seed = SHA256("raumata-mc-shadow" || bridge_secret || node_num)`.
-   Advertise each shadow identity as `ADV_TYPE_CHAT` and sign messages with it.
-   MeshCore apps then see one contact per Meshtastic node. The shadow identity
-   is controlled by the bridge; it is not cryptographic proof of the original
-   Meshtastic node.
-
-### 6.3 Loop prevention and security
-
-- Tag bridged messages with a compact bridge ID and maintain a recent
-  message-hash cache.
-- Never bridge a packet that already carries a bridge tag.
-- Do not bridge ACKs, routing control, PKI/direct messages, or telemetry in
-  the first version; text only.
-- Treat the bridge as a trusted translator. Document that shadow identities
-  are bridge-asserted.
-- Rate-limit bridged traffic and include it in the shared airtime budget;
-  bridging doubles transmissions.
-
-## 7. Simultaneous companion access
-
-### 7.1 Transport matrix
+### 6.1 Transport matrix
 
 | Stack | Transport | Status |
 | --- | --- | --- |
@@ -296,14 +252,14 @@ bridge cannot sign as an arbitrary Meshtastic node. Two options:
 | MeshCore | BLE Nordic UART service | Upstream MeshCore; not integrated here |
 | MeshCore | TCP 5000 (`SerialWifiInterface`) | Upstream MeshCore; not integrated here |
 
-### 7.2 Why one USB port cannot serve two apps
+### 6.2 Why one USB port cannot serve two apps
 
 USB CDC is one character device. Two mobile/desktop apps cannot both open the
 same CDC port at the same time. A host-side proxy could open the port once and
 expose two virtual serial ports, but that is a desktop-only workaround and not
 a firmware feature. For two apps, use two transports.
 
-### 7.3 Recommended v1: Meshtastic BLE + MeshCore USB
+### 6.3 Recommended v1: Meshtastic BLE + MeshCore USB
 
 - Meshtastic app connects over BLE using the existing NimBLE service.
 - MeshCore app connects over USB using the MeshCore companion framing.
@@ -321,7 +277,7 @@ Build flags:
 - `RAUMATA_COMPANION_MODE_BLE_USB` (default for the dual build)
 - `RAUMATA_MESHCORE_USB` (USB companion enabled)
 
-### 7.4 v2: dual-service BLE
+### 6.4 v2: dual-service BLE
 
 To run both apps over BLE:
 
@@ -344,7 +300,7 @@ To run both apps over BLE:
   filter by its service.
 - This is the best mobile UX but requires the most NimBLE work and testing.
 
-### 7.5 v3: dual TCP servers
+### 6.5 v3: dual TCP servers
 
 - Meshtastic `ServerAPI` already listens on TCP 4403.
 - Add a MeshCore TCP companion server on port 5000 using
@@ -353,7 +309,7 @@ To run both apps over BLE:
 - Useful for desktop/hosted nodes; mobile app support for TCP varies and WiFi
   increases power consumption.
 
-### 7.6 Shared-transport mux (only if one transport is unavoidable)
+### 6.6 Shared-transport mux (only if one transport is unavoidable)
 
 The current USB mux parses both framings and routes complete frames. It can
 support both protocols on one byte stream, but only one host application can
@@ -364,7 +320,7 @@ own the port. If this mode is retained:
 - Do not suppress one protocol when the other is active.
 - Keep the Meshtastic `PhoneAPI` and MeshCore companion each single-client.
 
-### 7.7 State and queues
+### 6.7 State and queues
 
 | Component | State owner | Concurrency |
 | --- | --- | --- |
@@ -374,7 +330,7 @@ own the port. If this mode is retained:
 | Identity/link | `NodeDB` + NVS | Read at boot; update on owner/key changes |
 | Message queues | Per stack | No shared protocol queue |
 
-## 8. Patch breakdown
+## 7. Patch breakdown
 
 Recommended next series (after the current six patches):
 
@@ -393,15 +349,9 @@ Recommended next series (after the current six patches):
 7. `transport: add MeshCore TCP companion` (optional v3)
    - TCP server on 5000, `MultiSerialInterface`.
 
-Optional bridge series (separate scope):
-
-8. `bridge: synthesize Meshtastic nodes for MeshCore contacts`
-9. `bridge: translate text and prevent loops`
-10. `bridge: synthesize MeshCore shadow identities for Meshtastic nodes`
-
 Each patch should build and be testable independently.
 
-## 9. Verification plan
+## 8. Verification plan
 
 - Build `heltec-v3-dual` with and without each optional transport.
 - Host-side tests for the link record, name sync, and companion frame
@@ -419,9 +369,10 @@ Each patch should build and be testable independently.
 - Airtime test: measure per-hour TX time for both stacks; verify the shared
   budget and region limits.
 - Regression: standard Meshtastic nodes and standard MeshCore peers still see
-  the node; no unexpected synthetic nodes unless bridge mode is enabled.
+  the node. MeshCore contacts do not show up as Meshtastic nodes, and
+  Meshtastic nodes do not show up as MeshCore contacts.
 
-## 10. Recommendation
+## 9. Recommendation
 
 - **Identity:** Mode A (independent keys + shared name + link record) for the
   first series. Keep Mode B (deterministic derivation) behind a build flag.
@@ -430,5 +381,5 @@ Each patch should build and be testable independently.
 - **Simultaneous apps:** Meshtastic BLE + MeshCore USB first. Add dual-service
   BLE only if both apps must be wireless; add TCP servers for desktop/hosted
   use.
-- **Cross-protocol node lists:** treat as an optional bridge, not part of the
-  basic “node appears in both” requirement.
+- **Separate protocols:** this device is visible on both meshes. Everyone
+  else's nodes stay in the app for their own protocol.

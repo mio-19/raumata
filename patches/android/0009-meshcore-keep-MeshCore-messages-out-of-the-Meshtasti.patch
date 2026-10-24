@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mio <mio@mio19.uk>
+Date: Sat, 24 Oct 2026 18:51:45 +1100
+Subject: [PATCH] meshcore: keep MeshCore messages out of the Meshtastic
+ conversation list
+
+The two protocols stay in their own apps. This tab does not translate nodes or messages across them.
+
+diff --git a/feature/meshcore/README.md b/feature/meshcore/README.md
+index c0a70cb1b6930fde6ed78e9094321b46edd7ab5b..311df0a9c64bb822fd1f69a584d4c402081d9b34 100644
+--- a/feature/meshcore/README.md
++++ b/feature/meshcore/README.md
+@@ -52,8 +52,8 @@ channel or contact opens a chat pane with a message composer.
+   firmware series. Use Meshtastic over Bluetooth while this tab uses USB: the
+   phone can claim that serial port only once, and the Meshtastic service reads
+   every byte on it.
+-- The app does not bridge MeshCore messages into the Meshtastic conversations
+-  list. That requires the optional bridge described in the raumata design docs.
++- MeshCore messages stay in this tab. They are not copied into the Meshtastic
++  conversation list, and Meshtastic nodes are not shown as MeshCore contacts.
+ - Only the companion subset implemented by the firmware is available: app
+   start, device query, contacts, channels, text, adverts and battery/storage.
+ - The USB transport is Android-only; desktop uses the no-op adapter until a
