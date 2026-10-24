@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mio <mio@mio19.uk>
+Date: Sat, 24 Oct 2026 18:46:29 +1100
+Subject: [PATCH] raumata: keep the New Zealand MeshCore preset as the NZ_865
+ default
+
+A MeshCore-profile mode on that region still has preset 11 to apply.
+
+diff --git a/src/raumata/OperatingMode.cpp b/src/raumata/OperatingMode.cpp
+index c13b393edb1b7d3acdc156bfaf2adbf44e125233..fcaa27f41bac70e994a23384c4a5deae4f5dac7e 100644
+--- a/src/raumata/OperatingMode.cpp
++++ b/src/raumata/OperatingMode.cpp
+@@ -134,10 +134,11 @@ uint8_t regionDefaultProfile(bool meshcore)
+     if (region == meshtastic_Config_LoRaConfig_RegionCode_EU_868) {
+         return 13;
+     }
+-    // NZ_865 is 864–868 MHz. The New Zealand MeshCore preset is 917 MHz and
+-    // belongs to the ANZ region, so it is not a legal default here.
++    // Meshtastic's NZ_865 plan is 864–868 MHz. The MeshCore New Zealand preset
++    // is the 917.375 MHz network this series already lists, so a MeshCore-profile
++    // mode still starts there instead of failing the switch.
+     if (region == meshtastic_Config_LoRaConfig_RegionCode_NZ_865) {
+-        return 0;
++        return 11;
+     }
+     return 10;
+ }

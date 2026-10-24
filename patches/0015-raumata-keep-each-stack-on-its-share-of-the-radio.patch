@@ -1,0 +1,622 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mio <mio@mio19.uk>
+Date: Sat, 24 Oct 2026 18:38:31 +1100
+Subject: [PATCH] raumata: keep each stack on its share of the radio
+
+The airtime gate now sees the port recorded before encryption, MeshCore transmits no longer wedge when the radio is busy, and a Meshtastic app edit is put back onto the chip in a MeshCore-profile mode.
+
+diff --git a/docs/raumata-dual-protocol.md b/docs/raumata-dual-protocol.md
+index f2dc07870d83a9e836bc310a6311de0b6f3f89e9..a617e5326aa153c06ebab85353e8efa17b0257e7 100644
+--- a/docs/raumata-dual-protocol.md
++++ b/docs/raumata-dual-protocol.md
+@@ -99,11 +99,12 @@ keep the Raumata link record, operating mode, and presence schedule.
+ 
+ ## Companion interface
+ 
+-A USB-serial mux parses both Meshtastic (`0x94 0xC3`) and MeshCore (`<`)
+-framing. With `RAUMATA_COMPANION_MODE_BLE_USB=1` (enabled by default in
+-`heltec-v3-dual`), USB starts in MeshCore companion mode so a Meshtastic app can
+-connect over BLE while a MeshCore app connects over USB simultaneously without
+-debug log or `FromRadio` queue contention.
++A USB-serial mux parses both Meshtastic (`0x94 0xC3`, big-endian length) and
++MeshCore (`<`, little-endian length) framing. With
++`RAUMATA_COMPANION_MODE_BLE_USB=1` (enabled by default in `heltec-v3-dual` and
++the T-Deck dual environments), USB ignores Meshtastic framing and stays in
++MeshCore companion mode, so a Meshtastic app can connect over BLE while a
++MeshCore app connects over USB without debug log or `FromRadio` contention.
+ 
+ ## Build
+ 
+diff --git a/src/mesh/RadioLibInterface.cpp b/src/mesh/RadioLibInterface.cpp
+index c9ce4fbd6c4d7d74d6a608f31cfaaad719539341..fdf42aed8249d311236adc98261dfb9366bff839 100644
+--- a/src/mesh/RadioLibInterface.cpp
++++ b/src/mesh/RadioLibInterface.cpp
+@@ -407,8 +407,7 @@ void RadioLibInterface::onNotify(uint32_t notification)
+                         txp = txQueue.dequeue();
+                         assert(txp);
+ #ifdef RAUMATA_DUAL_PROTOCOL
+-                        while (txp && !raumata::meshtasticPacketMayTransmit(txp->decoded.portnum, txp->priority,
+-                                                                          getPacketTime(txp))) {
++                        while (txp && !raumata::meshtasticPacketMayTransmit(txp, getPacketTime(txp))) {
+                             LOG_DEBUG("Drop Meshtastic background packet; operating mode keeps it off the air");
+                             packetPool.release(txp);
+                             txp = txQueue.empty() ? nullptr : txQueue.dequeue();
+@@ -755,7 +754,7 @@ bool RadioLibInterface::startSend(meshtastic_MeshPacket *txp)
+         packetPool.release(txp);
+         return false;
+ #ifdef RAUMATA_DUAL_PROTOCOL
+-    } else if (!raumata::meshtasticPacketMayTransmit(txp->decoded.portnum, txp->priority, getPacketTime(txp))) {
++    } else if (!raumata::meshtasticPacketMayTransmit(txp, getPacketTime(txp))) {
+         LOG_DEBUG("Drop Tx packet because the operating mode reserves background airtime for MeshCore");
+         packetPool.release(txp);
+         return false;
+diff --git a/src/mesh/Router.cpp b/src/mesh/Router.cpp
+index 96818339c24d50c43932c0228570726ef715443c..afbf4062b73600044760126f1bfac063ce6819c1 100644
+--- a/src/mesh/Router.cpp
++++ b/src/mesh/Router.cpp
+@@ -8,6 +8,9 @@
+ #include "RTC.h"
+ 
+ #include "configuration.h"
++#ifdef RAUMATA_DUAL_PROTOCOL
++#include "raumata/OperatingMode.h"
++#endif
+ #include "main.h"
+ #include "mesh-pb-constants.h"
+ #include "meshUtils.h"
+@@ -369,6 +372,10 @@ ErrorCode Router::send(meshtastic_MeshPacket *p)
+         meshtastic_MeshPacket *p_decoded = packetPool.allocCopy(*p);
+         DEBUG_HEAP_AFTER("Router::send", p_decoded);
+ 
++#ifdef RAUMATA_DUAL_PROTOCOL
++        // Stamp the port on the radio copy. perhapsEncode overwrites decoded.portnum.
++        raumata::rememberMeshtasticPort(p);
++#endif
+         auto encodeResult = perhapsEncode(p);
+         if (encodeResult != meshtastic_Routing_Error_NONE) {
+             packetPool.release(p_decoded);
+diff --git a/src/raumata/CompanionSerial.cpp b/src/raumata/CompanionSerial.cpp
+index f69da88e4db1cd35861048dade02db42eafbc84a..802e9acddc96b905ab2d31121e9c64321876a7a9 100644
+--- a/src/raumata/CompanionSerial.cpp
++++ b/src/raumata/CompanionSerial.cpp
+@@ -59,11 +59,18 @@ void CompanionSerial::loop()
+ 
+         switch (state_) {
+         case IDLE:
++#if defined(RAUMATA_COMPANION_MODE_BLE_USB) && RAUMATA_COMPANION_MODE_BLE_USB
++            // USB belongs to MeshCore. A Meshtastic frame must not flip the port.
++            if (c == '<') {
++                state_ = MESHCORE_LEN1;
++            }
++#else
+             if (c == 0x94) {
+                 state_ = MESHTASTIC_START2;
+             } else if (c == '<') {
+                 state_ = MESHCORE_LEN1;
+             }
++#endif
+             break;
+ 
+         case MESHTASTIC_START2:
+@@ -75,13 +82,20 @@ void CompanionSerial::loop()
+             break;
+ 
+         case MESHTASTIC_LEN1:
+-            frameLen_ = c;
++            // Meshtastic length is big-endian (StreamAPI: rxBuf[2] << 8 | rxBuf[3]).
++            frameLen_ = static_cast<uint16_t>(c) << 8;
+             state_ = MESHTASTIC_LEN2;
+             break;
+ 
+         case MESHTASTIC_LEN2:
+-            frameLen_ |= static_cast<uint16_t>(c) << 8;
+-            if (frameLen_ > 0 && frameLen_ <= sizeof(frame_)) {
++            frameLen_ |= c;
++            if (frameLen_ == 0) {
++                state_ = IDLE;
++                setMeshCoreMode(false);
++                if (console) {
++                    console->handleToRadio(frame_, 0);
++                }
++            } else if (frameLen_ <= sizeof(frame_)) {
+                 framePos_ = 0;
+                 state_ = MESHTASTIC_PAYLOAD;
+             } else {
+@@ -159,7 +173,7 @@ void CompanionSerial::enqueueMeshCoreFrame()
+ {
+     uint8_t next = static_cast<uint8_t>((queueHead_ + 1) % kQueueSize);
+     if (next == queueTail_) {
+-        return;
++        queueTail_ = static_cast<uint8_t>((queueTail_ + 1) % kQueueSize);
+     }
+     memcpy(queue_[queueHead_], frame_, frameLen_);
+     queueLen_[queueHead_] = frameLen_;
+diff --git a/src/raumata/MeshCoreRadio.cpp b/src/raumata/MeshCoreRadio.cpp
+index dc94ac3abc6a1fbe24be22431ff6dba307eb88a9..53f3bfe80011c34b9eae6c9f27c1694959fa717e 100644
+--- a/src/raumata/MeshCoreRadio.cpp
++++ b/src/raumata/MeshCoreRadio.cpp
+@@ -80,19 +80,21 @@ float MeshCoreRadio::packetScore(float snr, int packet_len)
+ 
+ bool MeshCoreRadio::startSendRaw(const uint8_t *bytes, int len)
+ {
+-    if (len <= 0 || len > MAX_TRANS_UNIT || pendingLen_ != 0 || sending_) {
++    const size_t framed = static_cast<size_t>(kMagicLen) + static_cast<size_t>(len);
++    if (len <= 0 || len > MAX_TRANS_UNIT || framed > MAX_LORA_PAYLOAD_LEN || pendingLen_ != 0 || sending_) {
+         return false;
+     }
+ 
+-    pendingLen_ = static_cast<uint16_t>(kMagicLen + len);
++    pendingLen_ = static_cast<uint16_t>(framed);
+     memcpy(pending_, kMagic, kMagicLen);
+     memcpy(pending_ + kMagicLen, bytes, len);
+ 
+     if (radio_.rawTransmit(pending_, pendingLen_)) {
+         pendingLen_ = 0;
+         sending_ = true;
++        txCount_++;
+     } else {
+-        // The Meshtastic stack is using the radio.  Keep the frame and let
++        // The Meshtastic stack is using the radio. Keep the frame and let
+         // loop() retry; report success so MeshCore does not free it.
+         sending_ = false;
+     }
+@@ -124,6 +126,20 @@ bool MeshCoreRadio::isSendComplete()
+ 
+ void MeshCoreRadio::onSendFinished()
+ {
++    if (pendingLen_ != 0 && !sending_) {
++        // Dispatcher timed out before the radio was free. Drop the frame so
++        // the next send is not stuck behind it.
++        pendingLen_ = 0;
++        return;
++    }
++    if (!sending_) {
++        return;
++    }
++    if (!radio_.rawTransmitDone()) {
++        // The airtime estimate expired while the chip is still transmitting.
++        // loop() finishes the radio operation after the interrupt.
++        return;
++    }
+     radio_.rawTransmitFinished();
+     sending_ = false;
+ }
+@@ -142,6 +158,10 @@ bool MeshCoreRadio::isReceiving()
+ 
+ void MeshCoreRadio::loop()
+ {
++    if (sending_ && radio_.rawTransmitDone()) {
++        radio_.rawTransmitFinished();
++        sending_ = false;
++    }
+     tryStartPending();
+ }
+ 
+diff --git a/src/raumata/OperatingMode.cpp b/src/raumata/OperatingMode.cpp
+index 29cdb4f9c801eb588f10cd5eff8de31196c13ad1..c13b393edb1b7d3acdc156bfaf2adbf44e125233 100644
+--- a/src/raumata/OperatingMode.cpp
++++ b/src/raumata/OperatingMode.cpp
+@@ -134,8 +134,10 @@ uint8_t regionDefaultProfile(bool meshcore)
+     if (region == meshtastic_Config_LoRaConfig_RegionCode_EU_868) {
+         return 13;
+     }
++    // NZ_865 is 864–868 MHz. The New Zealand MeshCore preset is 917 MHz and
++    // belongs to the ANZ region, so it is not a legal default here.
+     if (region == meshtastic_Config_LoRaConfig_RegionCode_NZ_865) {
+-        return 11;
++        return 0;
+     }
+     return 10;
+ }
+@@ -243,18 +245,39 @@ bool meshtasticAirtimeAllows(uint32_t estAirtimeMs)
+     return sumBuckets(gMeshtasticTxMs) + estAirtimeMs <= hourlyBudgetMs(share);
+ }
+ 
+-bool meshtasticPacketMayTransmit(uint8_t portnum, uint8_t priority, uint32_t estAirtimeMs)
++constexpr int32_t kPortStampBase = 30000;
++
++void rememberMeshtasticPort(meshtastic_MeshPacket *packet)
++{
++    if (!packet || packet->which_payload_variant != meshtastic_MeshPacket_decoded_tag) {
++        return;
++    }
++    int port = static_cast<int>(packet->decoded.portnum);
++    if (port < 0 || port > 511) {
++        port = 0;
++    }
++    packet->rx_rssi = kPortStampBase + port;
++}
++
++bool meshtasticPacketMayTransmit(const meshtastic_MeshPacket *packet, uint32_t estAirtimeMs)
+ {
+-    const bool essential = portnum == meshtastic_PortNum_TEXT_MESSAGE_APP ||
+-                           portnum == meshtastic_PortNum_ROUTING_APP || portnum == meshtastic_PortNum_ADMIN_APP;
+-    if (essential) {
++    uint8_t portnum = 0;
++    uint8_t priority = packet ? packet->priority : 0;
++    bool portKnown = false;
++    if (packet && packet->rx_rssi >= kPortStampBase && packet->rx_rssi < kPortStampBase + 512) {
++        portnum = static_cast<uint8_t>(packet->rx_rssi - kPortStampBase);
++        portKnown = true;
++    }
++
++    if (portKnown && (portnum == meshtastic_PortNum_TEXT_MESSAGE_APP || portnum == meshtastic_PortNum_ROUTING_APP ||
++                      portnum == meshtastic_PortNum_ADMIN_APP)) {
+         return true;
+     }
+ 
+-    const bool presenceTraffic = portnum == meshtastic_PortNum_NODEINFO_APP ||
+-                                 portnum == meshtastic_PortNum_POSITION_APP ||
+-                                 portnum == meshtastic_PortNum_TELEMETRY_APP ||
+-                                 priority < meshtastic_MeshPacket_Priority_DEFAULT;
++    const bool presenceTraffic =
++        (portKnown && (portnum == meshtastic_PortNum_NODEINFO_APP || portnum == meshtastic_PortNum_POSITION_APP ||
++                       portnum == meshtastic_PortNum_TELEMETRY_APP)) ||
++        priority < meshtastic_MeshPacket_Priority_DEFAULT;
+     if (!meshtasticPresenceEnabled() && presenceTraffic) {
+         return false;
+     }
+@@ -328,16 +351,18 @@ bool applyOperatingMode(OperatingMode mode)
+         return false;
+     }
+ 
+-    const bool changed = gMode != mode;
++    const OperatingMode previous = gMode;
+     gMode = mode;
+-    saveModeToNvs();
+ 
+     if (!profileKindAllowed(static_cast<uint8_t>(activePhyProfile().kind))) {
+-        return applyPhyProfile(defaultProfileIdForMode(mode));
+-    }
+-    if (changed) {
++        if (!applyPhyProfile(defaultProfileIdForMode(mode))) {
++            gMode = previous;
++            return false;
++        }
++    } else if (previous != mode) {
+         notifyOperatingModeChanged();
+     }
++    saveModeToNvs();
+     return true;
+ }
+ 
+diff --git a/src/raumata/OperatingMode.h b/src/raumata/OperatingMode.h
+index a2c9e0583b24451ea21e2099c1c8f73494af60ed..d0fdcd06cf67c4ca7db386f6f98e33624024c324 100644
+--- a/src/raumata/OperatingMode.h
++++ b/src/raumata/OperatingMode.h
+@@ -3,6 +3,8 @@
+ #include <cstddef>
+ #include <cstdint>
+ 
++#include "mesh/generated/meshtastic/mesh.pb.h"
++
+ namespace raumata {
+ 
+ /**
+@@ -47,12 +49,21 @@ void noteStackAirtime(bool meshcore, uint32_t airtimeMs);
+ /// True when another MeshCore background transmission of estAirtimeMs fits its share.
+ bool meshCoreAirtimeAllows(uint32_t estAirtimeMs);
+ 
++/// True when another Meshtastic background transmission of estAirtimeMs fits its share.
++bool meshtasticAirtimeAllows(uint32_t estAirtimeMs);
++
++/**
++ * Record the port number before encryption. The radio queue only sees the
++ * ciphertext, which shares storage with the decoded port.
++ */
++void rememberMeshtasticPort(meshtastic_MeshPacket *packet);
++
+ /**
+  * False when this Meshtastic packet is background traffic the active mode
+  * does not allow, or when it would push Meshtastic past its hourly share.
+  * Text, routing, and admin packets are kept.
+  */
+-bool meshtasticPacketMayTransmit(uint8_t portnum, uint8_t priority, uint32_t estAirtimeMs);
++bool meshtasticPacketMayTransmit(const meshtastic_MeshPacket *packet, uint32_t estAirtimeMs);
+ 
+ /// True when the active mode may use this PhyProfileKind.
+ bool profileKindAllowed(uint8_t kind);
+diff --git a/src/raumata/PhyProfile.cpp b/src/raumata/PhyProfile.cpp
+index ae6db82e1d4aa5acc9d129d7cd9f8189c7be9159..cc86d34f66c7b777301e2b919818722c69225c83 100644
+--- a/src/raumata/PhyProfile.cpp
++++ b/src/raumata/PhyProfile.cpp
+@@ -185,7 +185,9 @@ PhyProfile deriveProfileFromMeshtasticConfig(uint8_t fallbackSync, uint16_t fall
+         modemPresetToParams(config.lora.modem_preset, false, bw, sf, cr);
+ 
+         PhyProfile msh = {};
+-        msh.id = 1;
++        // Not a table row. Id 1 is ANZ LongFast; using it would replace this
++        // modem with that preset the next time the profile is loaded.
++        msh.id = kPhyProfileCustomId;
+         msh.name = "Meshtastic Preset";
+         msh.kind = PHY_MESHTASTIC_PRESET;
+         msh.msh_modem_preset = static_cast<uint8_t>(config.lora.modem_preset);
+@@ -428,6 +430,9 @@ void onMeshtasticConfigChanged()
+         if (gRadio) {
+             gRadio->setSyncWord(activeSyncWord());
+             gRadio->setPreambleLength(activePreambleLength());
++            // The radio observer already applied the app's edit. Put the chip
++            // back on the saved MeshCore profile before this guard clears.
++            gRadio->reconfigure();
+         }
+         if (nodeDB) {
+             nodeDB->saveToDisk(SEGMENT_CONFIG);
+diff --git a/src/raumata/PresenceScheduler.cpp b/src/raumata/PresenceScheduler.cpp
+index 04e6fbf78db5de6d55451f7abbea1d099f47cc05..9bbe4c41696016ad2d6d71bf0c49ec553167aff3 100644
+--- a/src/raumata/PresenceScheduler.cpp
++++ b/src/raumata/PresenceScheduler.cpp
+@@ -28,49 +28,67 @@ void PresenceScheduler::begin(MyMesh &node)
+     pendingReAdvertMeshtastic_ = false;
+ }
+ 
++namespace {
++
++constexpr uint32_t kRetryDelayMs = 30UL * 1000UL;
++
++} // namespace
++
+ void PresenceScheduler::loop(MyMesh &node)
+ {
+     uint32_t now = millis();
+ 
+     if (meshCorePresenceEnabled() && !bootMeshCoreSent_ && static_cast<int32_t>(now - nextMeshCoreAdvertMs_) >= 0) {
+-        bootMeshCoreSent_ = true;
+-        if (canSendBackgroundAdvert(250)) {
++        if (canSendMeshCoreAdvert(250)) {
+             node.sendSelfAdvert(true);
++            bootMeshCoreSent_ = true;
++            nextMeshCoreAdvertMs_ = now + kPeriodicIntervalMs + jitterMs_;
++        } else {
++            nextMeshCoreAdvertMs_ = now + kRetryDelayMs;
+         }
+-        nextMeshCoreAdvertMs_ = now + kPeriodicIntervalMs + jitterMs_;
+     }
+ 
+     if (meshtasticPresenceEnabled() && !bootMeshtasticSent_ &&
+         static_cast<int32_t>(now - nextMeshtasticNodeInfoMs_) >= 0) {
+-        bootMeshtasticSent_ = true;
+-        if (nodeInfoModule && canSendBackgroundAdvert(250)) {
++        if (nodeInfoModule && canSendMeshtasticNodeInfo(250)) {
+             nodeInfoModule->sendOurNodeInfo(NODENUM_BROADCAST, false, 0, true);
++            bootMeshtasticSent_ = true;
++        } else if (!nodeInfoModule) {
++            bootMeshtasticSent_ = true;
++        } else {
++            nextMeshtasticNodeInfoMs_ = now + kRetryDelayMs;
+         }
+     }
+ 
+     if (meshCorePresenceEnabled() && bootMeshCoreSent_ && pendingReAdvertMeshCore_ &&
+         static_cast<int32_t>(now - nextMeshCoreAdvertMs_) >= 0) {
+-        pendingReAdvertMeshCore_ = false;
+-        if (canSendBackgroundAdvert(250)) {
++        if (canSendMeshCoreAdvert(250)) {
+             node.sendSelfAdvert(true);
++            pendingReAdvertMeshCore_ = false;
++            nextMeshCoreAdvertMs_ = now + kPeriodicIntervalMs + jitterMs_;
++        } else {
++            nextMeshCoreAdvertMs_ = now + kRetryDelayMs;
+         }
+-        nextMeshCoreAdvertMs_ = now + kPeriodicIntervalMs + jitterMs_;
+     }
+ 
+     if (meshtasticPresenceEnabled() && bootMeshtasticSent_ && pendingReAdvertMeshtastic_ &&
+         static_cast<int32_t>(now - nextMeshtasticNodeInfoMs_) >= 0) {
+-        pendingReAdvertMeshtastic_ = false;
+-        if (nodeInfoModule && canSendBackgroundAdvert(250)) {
++        if (nodeInfoModule && canSendMeshtasticNodeInfo(250)) {
+             nodeInfoModule->sendOurNodeInfo(NODENUM_BROADCAST, false, 0, true);
++            pendingReAdvertMeshtastic_ = false;
++        } else {
++            nextMeshtasticNodeInfoMs_ = now + kRetryDelayMs;
+         }
+     }
+ 
+     if (meshCorePresenceEnabled() && bootMeshCoreSent_ && !pendingReAdvertMeshCore_ &&
+         static_cast<int32_t>(now - nextMeshCoreAdvertMs_) >= 0) {
+-        if (canSendBackgroundAdvert(250)) {
++        if (canSendMeshCoreAdvert(250)) {
+             node.sendSelfAdvert(true);
++            nextMeshCoreAdvertMs_ = now + kPeriodicIntervalMs + jitterMs_;
++        } else {
++            nextMeshCoreAdvertMs_ = now + kRetryDelayMs;
+         }
+-        nextMeshCoreAdvertMs_ = now + kPeriodicIntervalMs + jitterMs_;
+     }
+ }
+ 
+@@ -103,7 +121,7 @@ float PresenceScheduler::meshCoreBudgetFactor()
+     return factor < 1.0f ? 1.0f : factor;
+ }
+ 
+-bool PresenceScheduler::canSendBackgroundAdvert(uint32_t estAirtimeMs)
++bool PresenceScheduler::canSendMeshCoreAdvert(uint32_t estAirtimeMs)
+ {
+     if (!meshCorePresenceEnabled()) {
+         return false;
+@@ -114,6 +132,17 @@ bool PresenceScheduler::canSendBackgroundAdvert(uint32_t estAirtimeMs)
+     return meshCoreAirtimeAllows(estAirtimeMs);
+ }
+ 
++bool PresenceScheduler::canSendMeshtasticNodeInfo(uint32_t estAirtimeMs)
++{
++    if (!meshtasticPresenceEnabled()) {
++        return false;
++    }
++    if (airTime && (!airTime->isTxAllowedChannelUtil(true) || !airTime->isTxAllowedAirUtil())) {
++        return false;
++    }
++    return meshtasticAirtimeAllows(estAirtimeMs);
++}
++
+ } // namespace raumata
+ 
+ #endif // RAUMATA_DUAL_PROTOCOL
+diff --git a/src/raumata/PresenceScheduler.h b/src/raumata/PresenceScheduler.h
+index e5c9da90f6e7532d47b80ac1e94f76449b113d7d..2e9bcf12b5581ad857f753a7279cba6fc0d30288 100644
+--- a/src/raumata/PresenceScheduler.h
++++ b/src/raumata/PresenceScheduler.h
+@@ -33,8 +33,11 @@ class PresenceScheduler
+     /// Compute the Dispatcher airtime budget factor for the MeshCore stack.
+     static float meshCoreBudgetFactor();
+ 
+-    /// Check whether background presence traffic is permitted under the shared airtime budget.
+-    static bool canSendBackgroundAdvert(uint32_t estAirtimeMs);
++    /// MeshCore advert against MeshCore presence and that stack's hourly share.
++    static bool canSendMeshCoreAdvert(uint32_t estAirtimeMs);
++
++    /// Meshtastic NodeInfo against Meshtastic presence and that stack's hourly share.
++    static bool canSendMeshtasticNodeInfo(uint32_t estAirtimeMs);
+ 
+   private:
+     uint32_t bootMs_ = 0;
+diff --git a/src/raumata/RaumataProtocol.cpp b/src/raumata/RaumataProtocol.cpp
+index e47ab588626b5f032cb348e87d623f6aafa9976d..60a87288175efe7eda06c4e0cff923ca64a4226f 100644
+--- a/src/raumata/RaumataProtocol.cpp
++++ b/src/raumata/RaumataProtocol.cpp
+@@ -106,19 +106,14 @@ void migrateIdentity(DataStore &store)
+         uint8_t seed_[32];
+     };
+ 
+-    RaumataLinkRecord link = {};
+-    uint8_t currentFp[8];
+-    computeMeshtasticPubKeyFingerprint(currentFp);
+-    bool fpMatches = loadLinkRecord(link) && link.mode == RAUMATA_ID_DERIVED &&
+-                     memcmp(link.msh_pubkey_fp, currentFp, sizeof(currentFp)) == 0;
+-    if (!fpMatches) {
+-        uint8_t seed[32];
+-        if (deriveMeshCoreSeed(seed)) {
+-            SeedRng seedRng(seed);
+-            id = mesh::LocalIdentity(&seedRng);
+-            memset(seed, 0, sizeof(seed));
+-            have = true;
+-        }
++    // The identity file is already gone. A matching link record is the case
++    // that must be derived again; a changed Meshtastic key must be derived too.
++    uint8_t seed[32];
++    if (deriveMeshCoreSeed(seed)) {
++        SeedRng seedRng(seed);
++        id = mesh::LocalIdentity(&seedRng);
++        memset(seed, 0, sizeof(seed));
++        have = true;
+     }
+ #endif
+ 
+diff --git a/src/raumata/companion/CompanionHooks.cpp b/src/raumata/companion/CompanionHooks.cpp
+index b2924bb31bc88512363c8cfe56b355fd76e3b65b..4e1f526de678a1d3d77ba000ad905006b477e89c 100644
+--- a/src/raumata/companion/CompanionHooks.cpp
++++ b/src/raumata/companion/CompanionHooks.cpp
+@@ -45,6 +45,7 @@ void writeErr(BaseSerialInterface *serial, uint8_t err)
+ }
+ 
+ bool gCoordOverride = false;
++bool gRadioPrefsDirty = false;
+ 
+ } // namespace
+ 
+@@ -95,10 +96,18 @@ bool applyCompanionSetting(const char *key, const char *value, char *nodeName, s
+     }
+     if (strcmp(key, "mode") == 0) {
+         OperatingMode mode;
+-        return parseOperatingModeName(value, mode) && applyOperatingMode(mode);
++        if (!parseOperatingModeName(value, mode) || !applyOperatingMode(mode)) {
++            return false;
++        }
++        gRadioPrefsDirty = true;
++        return true;
+     }
+     if (strcmp(key, "phy.id") == 0 || strcmp(key, "phy_profile") == 0) {
+-        return applyPhyProfile(static_cast<uint8_t>(strtoul(value, nullptr, 10)));
++        if (!applyPhyProfile(static_cast<uint8_t>(strtoul(value, nullptr, 10)))) {
++            return false;
++        }
++        gRadioPrefsDirty = true;
++        return true;
+     }
+     if (strcmp(key, "mc.name") == 0 && value[0] != 0 && nodeName && nodeNameLen > 1) {
+         strncpy(nodeName, value, nodeNameLen - 1);
+@@ -108,6 +117,13 @@ bool applyCompanionSetting(const char *key, const char *value, char *nodeName, s
+     return false;
+ }
+ 
++bool consumeCompanionRadioPrefsSync()
++{
++    const bool dirty = gRadioPrefsDirty;
++    gRadioPrefsDirty = false;
++    return dirty;
++}
++
+ void appendCompanionCustomVars(char *dest, size_t destSize)
+ {
+     if (!dest || destSize == 0) {
+@@ -249,6 +265,7 @@ bool handleCompanionExtension(const uint8_t *frame, size_t len, BaseSerialInterf
+         ok = applyPhyProfile(id);
+     }
+     if (ok) {
++        gRadioPrefsDirty = true;
+         writeOk(serial);
+     } else {
+         writeErr(serial, id == kPhyProfileCustomId ? ERR_CODE_ILLEGAL_ARG : ERR_CODE_NOT_FOUND);
+diff --git a/src/raumata/companion/CompanionHooks.h b/src/raumata/companion/CompanionHooks.h
+index 352fd59b8af0230b3c3037fffeea72419f2dd8e0..711a2445631d987b79ec8787194c97729336ce08 100644
+--- a/src/raumata/companion/CompanionHooks.h
++++ b/src/raumata/companion/CompanionHooks.h
+@@ -15,6 +15,9 @@ bool acceptCompanionRadio(float freqMhz, float bwKhz, uint8_t sf, uint8_t cr);
+ bool applyCompanionSetting(const char *key, const char *value, char *nodeName, size_t nodeNameLen);
+ void appendCompanionCustomVars(char *dest, size_t destSize);
+ 
++/// True once, after a companion command changed the shared radio profile.
++bool consumeCompanionRadioPrefsSync();
++
+ void noteCompanionCoordOverride();
+ void setCompanionCoords(double lat, double lon);
+ void refreshCompanionLocation(double &lat, double &lon);
+diff --git a/src/raumata/companion/MyMesh.cpp b/src/raumata/companion/MyMesh.cpp
+index 62c4d27d440f04221e093aaa07b14ba40b1b4d46..c3632ef5146fbdf7fc47fa406c1159ca54f2f6b5 100644
+--- a/src/raumata/companion/MyMesh.cpp
++++ b/src/raumata/companion/MyMesh.cpp
+@@ -1892,6 +1892,9 @@ void MyMesh::handleCmdFrame(size_t len) {
+       *np++ = 0; // modify 'cmd_frame', replace ':' with null
+       bool success = raumata::applyCompanionSetting(sp, np, _prefs.node_name, sizeof(_prefs.node_name));
+       if (success) {
++        if (raumata::consumeCompanionRadioPrefsSync()) {
++          raumata::syncCompanionRadioPrefs(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr, _prefs.tx_power_dbm);
++        }
+         savePrefs();
+       } else {
+         success = sensors.setSettingValue(sp, np);
+@@ -2081,7 +2084,12 @@ void MyMesh::handleCmdFrame(size_t len) {
+     } else {
+       writeErrFrame(ERR_CODE_TABLE_FULL);
+     }
+-  } else if (!raumata::handleCompanionExtension(cmd_frame, len, _serial)) {
++  } else if (raumata::handleCompanionExtension(cmd_frame, len, _serial)) {
++    if (raumata::consumeCompanionRadioPrefsSync()) {
++      raumata::syncCompanionRadioPrefs(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr, _prefs.tx_power_dbm);
++      savePrefs();
++    }
++  } else {
+     writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
+     MESH_DEBUG_PRINTLN("ERROR: unknown command: %02X", cmd_frame[0]);
+   }
+diff --git a/src/raumata/companion/RaumataBoard.cpp b/src/raumata/companion/RaumataBoard.cpp
+index 6199c214553dc5d42ff19b9809df4ca67a023c74..656f156c9eedf6cb5d499d6aa311309946a4a526 100644
+--- a/src/raumata/companion/RaumataBoard.cpp
++++ b/src/raumata/companion/RaumataBoard.cpp
+@@ -7,6 +7,7 @@
+ #include <esp_system.h>
+ 
+ #include "CompanionHooks.h"
++#include "raumata/CompanionProtocol.h"
+ #include "PowerStatus.h"
+ #include "mesh/NodeDB.h"
+ #include "raumata/MeshCoreRadio.h"
+@@ -81,7 +82,7 @@ uint16_t RaumataBoard::getBattMilliVolts()
+ 
+ const char *RaumataBoard::getManufacturerName() const
+ {
+-    return "Raumata";
++    return raumata::protocol::MANUFACTURER_NAME;
+ }
+ 
+ void RaumataBoard::reboot()

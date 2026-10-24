@@ -1,0 +1,393 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mio <mio@mio19.uk>
+Date: Sat, 24 Oct 2026 18:38:31 +1100
+Subject: [PATCH] meshcore: speak MeshCoreKmp 0.12 and keep the radio controls
+ up
+
+Direct messages, adverts, and contact refresh use the library's real calls, and the mode chips stay available when the node has not reported a mode yet.
+
+diff --git a/feature/meshcore/README.md b/feature/meshcore/README.md
+index 9711a18b66cdb49bd74db4304dbd8b12fba59402..c0a70cb1b6930fde6ed78e9094321b46edd7ab5b 100644
+--- a/feature/meshcore/README.md
++++ b/feature/meshcore/README.md
+@@ -49,7 +49,9 @@ channel or contact opens a chat pane with a message composer.
+ 
+ - MeshCore's BLE companion service must be enabled in the firmware. The current
+   firmware exposes MeshCore over USB; BLE MeshCore support is a separate
+-  firmware series.
++  firmware series. Use Meshtastic over Bluetooth while this tab uses USB: the
++  phone can claim that serial port only once, and the Meshtastic service reads
++  every byte on it.
+ - The app does not bridge MeshCore messages into the Meshtastic conversations
+   list. That requires the optional bridge described in the raumata design docs.
+ - Only the companion subset implemented by the firmware is available: app
+diff --git a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreRepository.kt b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreRepository.kt
+index dcacc3922e916f165714335f3ed62b8d06a047bf..48a7755664ca999dbd5df026d9fceb8e5789b7fa 100644
+--- a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreRepository.kt
++++ b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreRepository.kt
+@@ -50,8 +50,8 @@ import org.meshtastic.feature.meshcore.model.MeshCoreTransport
+ import org.meshtastic.feature.meshcore.model.OperatingMode
+ import org.meshtastic.feature.meshcore.model.RaumataRadioState
+ import org.meshtastic.feature.meshcore.model.radioStateFromCustomVars
++import org.meshtastic.feature.meshcore.model.decodePrefixHex
+ import org.meshtastic.feature.meshcore.model.publicKeyPrefixHex
+-import org.meshtastic.feature.meshcore.model.toPrefixHex
+ 
+ /**
+  * Owns the MeshCore companion connection independently of the Meshtastic radio.
+@@ -123,6 +123,11 @@ class MeshCoreRepository(
+     private val _radio = MutableStateFlow<RaumataRadioState?>(null)
+     val radio: StateFlow<RaumataRadioState?> = _radio.asStateFlow()
+ 
++    private val _power = MutableStateFlow<String?>(null)
++    val power: StateFlow<String?> = _power.asStateFlow()
++
++    private var messageDeviceId: String? = null
++
+     init {
+         scope.launch {
+             connection
+@@ -143,7 +148,7 @@ class MeshCoreRepository(
+                                 MeshCoreChatMessage(
+                                     text = message.text,
+                                     outgoing = false,
+-                                    contactPrefix = message.publicKeyPrefix.toPrefixHex(),
++                                    contactPrefix = message.publicKeyPrefix,
+                                     timestamp = message.timestamp,
+                                 )
+                         }
+@@ -153,6 +158,13 @@ class MeshCoreRepository(
+     }
+ 
+     fun startScan(transport: MeshCoreTransport?) {
++        _error.value = null
++        if (transport == MeshCoreTransport.USB) {
++            bleScanner.stopScan()
++        }
++        if (transport == MeshCoreTransport.BLE) {
++            usbScanner.stopScan()
++        }
+         if (transport == null || transport == MeshCoreTransport.BLE) {
+             runCatching { bleScanner.startScan(scope = scope) }
+                 .onFailure { _error.value = it.message ?: "Bluetooth scan failed" }
+@@ -187,9 +199,16 @@ class MeshCoreRepository(
+             }
+             .onSuccess {
+                 connection.value = it
+-                _messages.value = emptyList()
++                if (messageDeviceId != device.id) {
++                    _messages.value = emptyList()
++                    messageDeviceId = device.id
++                }
+                 _radio.value = null
++                _power.value = null
++                // autoFetchContacts is not applied by MeshCoreKmp's initialize().
++                runCatching { it.getContacts() }
+                 refreshRadio()
++                refreshPower()
+             }
+             .onFailure { _error.value = it.message ?: "Could not connect to MeshCore device" }
+     }
+@@ -198,11 +217,13 @@ class MeshCoreRepository(
+         connection.value?.disconnect()
+         connection.value = null
+         _radio.value = null
++        _power.value = null
+     }
+ 
+-    suspend fun sendChannelMessage(channelIndex: Int, text: String) {
+-        val conn = connection.value ?: return
+-        runCatching { conn.sendChannelMessage(channelIndex = channelIndex, text = text) }
++    suspend fun sendChannelMessage(channelIndex: Int, text: String): Boolean {
++        val conn = connection.value ?: return false
++        _error.value = null
++        return runCatching { conn.sendChannelMessage(channelIndex = channelIndex, text = text) }
+             .onSuccess {
+                 _messages.update {
+                     (it +
+@@ -215,11 +236,13 @@ class MeshCoreRepository(
+                 }
+             }
+             .onFailure { _error.value = it.message ?: "Could not send MeshCore message" }
++            .isSuccess
+     }
+ 
+-    suspend fun sendDirectMessage(contact: Contact, text: String) {
+-        val conn = connection.value ?: return
+-        runCatching { conn.sendDirectMessage(publicKeyPrefix = contact.publicKeyPrefix, text = text) }
++    suspend fun sendDirectMessage(contact: Contact, text: String): Boolean {
++        val conn = connection.value ?: return false
++        _error.value = null
++        return runCatching { conn.sendDirectMessage(publicKeyPrefix = contact.publicKeyPrefix.decodePrefixHex(), text = text) }
+             .onSuccess {
+                 _messages.update {
+                     (it +
+@@ -232,24 +255,42 @@ class MeshCoreRepository(
+                 }
+             }
+             .onFailure { _error.value = it.message ?: "Could not send MeshCore message" }
++            .isSuccess
+     }
+ 
+     suspend fun sendSelfAdvert(flood: Boolean = true) {
+         val conn = connection.value ?: return
+-        runCatching { conn.sendSelfAdvert(flood = flood) }
++        _error.value = null
++        runCatching { conn.sendAdvert(flood = flood) }
+             .onFailure { _error.value = it.message ?: "Could not send MeshCore advert" }
+     }
+ 
+     suspend fun refresh() {
+         val conn = connection.value ?: return
++        _error.value = null
+         runCatching {
+-                conn.refreshChannels()
+-                conn.refreshContacts()
++                conn.getAllChannels()
++                conn.getContacts()
+                 refreshRadio()
++                refreshPower()
+             }
+             .onFailure { _error.value = it.message ?: "Could not refresh MeshCore state" }
+     }
+ 
++    private suspend fun refreshPower() {
++        val conn = connection.value ?: return
++        runCatching { conn.getBattery() }
++            .onSuccess { info ->
++                val storage =
++                    if (info.usedStorageKb != null && info.totalStorageKb != null) {
++                        " · storage ${info.usedStorageKb}/${info.totalStorageKb} KB"
++                    } else {
++                        ""
++                    }
++                _power.value = "${info.milliVolts} mV (${info.levelPercent}%)$storage"
++            }
++    }
++
+     suspend fun refreshRadio() {
+         val conn = connection.value ?: return
+         radioMutex.withLock {
+@@ -261,6 +302,7 @@ class MeshCoreRepository(
+ 
+     suspend fun setOperatingMode(mode: OperatingMode) {
+         val conn = connection.value ?: return
++        _error.value = null
+         radioMutex.withLock {
+             runCatching { conn.setCustomVar("mode", mode.wire) }
+                 .onSuccess { _radio.value = radioStateFromCustomVars(conn.getCustomVars()) }
+@@ -270,6 +312,7 @@ class MeshCoreRepository(
+ 
+     suspend fun setPhyProfile(id: Int) {
+         val conn = connection.value ?: return
++        _error.value = null
+         radioMutex.withLock {
+             runCatching { conn.setCustomVar("phy.id", id.toString()) }
+                 .onSuccess { _radio.value = radioStateFromCustomVars(conn.getCustomVars()) }
+diff --git a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreViewModel.kt b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreViewModel.kt
+index f61f4f07ca597874aa6e56b72a4407c59601f652..0e7ab5014956aca5eb96eb65672ab85aaac991ac 100644
+--- a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreViewModel.kt
++++ b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreViewModel.kt
+@@ -37,6 +37,7 @@ class MeshCoreViewModel(private val repository: MeshCoreRepository) : ViewModel(
+     val selfInfo = repository.selfInfo
+     val messages = repository.messages
+     val radio = repository.radio
++    val power = repository.power
+     val error = repository.error
+ 
+     private val _transport = MutableStateFlow(MeshCoreTransport.USB)
+@@ -79,15 +80,21 @@ class MeshCoreViewModel(private val repository: MeshCoreRepository) : ViewModel(
+         _selectedContact.value = null
+     }
+ 
+-    fun send(text: String) {
+-        if (text.isBlank()) return
++    fun send(text: String, onResult: (Boolean) -> Unit = {}) {
++        if (text.isBlank()) {
++            onResult(false)
++            return
++        }
+         viewModelScope.launch {
+             val channel = _selectedChannel.value
+             val contact = _selectedContact.value
+-            when {
+-                channel != null -> repository.sendChannelMessage(channel, text)
+-                contact != null -> repository.sendDirectMessage(contact, text)
+-            }
++            val ok =
++                when {
++                    channel != null -> repository.sendChannelMessage(channel, text)
++                    contact != null -> repository.sendDirectMessage(contact, text)
++                    else -> false
++                }
++            onResult(ok)
+         }
+     }
+ 
+diff --git a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/model/MeshCoreModels.kt b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/model/MeshCoreModels.kt
+index 43fd0b0ee0d6967b6a3faf715a7c02644e516993..686021d1906b2e4b34e784b683629ff98998bfbd 100644
+--- a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/model/MeshCoreModels.kt
++++ b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/model/MeshCoreModels.kt
+@@ -31,7 +31,14 @@ fun ByteArray.toPrefixHex(): String = joinToString(separator = "") { byte ->
+ }
+ 
+ /** Return the 6-byte public-key prefix of a MeshCore [Contact] as lowercase hex. */
+-fun Contact.publicKeyPrefixHex(): String = publicKeyPrefix.toPrefixHex()
++fun Contact.publicKeyPrefixHex(): String = publicKeyPrefix
++
++/** Decode a 12-character MeshCore public-key prefix into the 6 bytes the library sends. */
++fun String.decodePrefixHex(): ByteArray {
++    val clean = trim()
++    require(clean.length == 12) { "MeshCore public key prefix must be 12 hex characters" }
++    return ByteArray(6) { index -> clean.substring(index * 2, index * 2 + 2).toInt(16).toByte() }
++}
+ 
+ /** A MeshCore companion discovered on a transport. */
+ data class MeshCoreDevice(
+diff --git a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/ui/MeshCoreScreen.kt b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/ui/MeshCoreScreen.kt
+index 52cc29d039776ea5a27bf6ffc123223c99e712b9..e077b8014faac67369f867a7d4bfee5763a7dc23 100644
+--- a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/ui/MeshCoreScreen.kt
++++ b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/ui/MeshCoreScreen.kt
+@@ -64,7 +64,6 @@ import org.meshtastic.feature.meshcore.model.OperatingMode
+ import org.meshtastic.feature.meshcore.model.RaumataRadioState
+ import org.meshtastic.feature.meshcore.model.phyPresets
+ import org.meshtastic.feature.meshcore.model.publicKeyPrefixHex
+-import org.meshtastic.feature.meshcore.model.toPrefixHex
+ 
+ /**
+  * Dedicated MeshCore companion surface. It deliberately does not reuse the
+@@ -84,6 +83,7 @@ fun MeshCoreScreen(viewModel: MeshCoreViewModel = koinViewModel()) {
+     val selectedChannel by viewModel.selectedChannel.collectAsState()
+     val selectedContact by viewModel.selectedContact.collectAsState()
+     val radio by viewModel.radio.collectAsState()
++    val power by viewModel.power.collectAsState()
+     val error by viewModel.error.collectAsState()
+ 
+     val connected = connectionState is ConnectionState.Connected
+@@ -103,7 +103,7 @@ fun MeshCoreScreen(viewModel: MeshCoreViewModel = koinViewModel()) {
+         },
+     ) { padding ->
+         Column(modifier = Modifier.padding(padding).fillMaxSize()) {
+-            ConnectionBanner(connectionState, selfInfo)
++            ConnectionBanner(connectionState, selfInfo, radio, power)
+             error?.let {
+                 Text(
+                     text = it,
+@@ -115,7 +115,7 @@ fun MeshCoreScreen(viewModel: MeshCoreViewModel = koinViewModel()) {
+             if (!connected) {
+                 DevicePicker(
+                     transport = transport,
+-                    devices = devices,
++                    devices = devices.filter { it.transport == transport },
+                     onTransport = viewModel::setTransport,
+                     onScan = viewModel::scan,
+                     onConnect = viewModel::connect,
+@@ -160,17 +160,28 @@ fun MeshCoreScreen(viewModel: MeshCoreViewModel = koinViewModel()) {
+ }
+ 
+ @Composable
+-private fun ConnectionBanner(state: ConnectionState, selfInfo: SelfInfo?) {
++private fun ConnectionBanner(
++    state: ConnectionState,
++    selfInfo: SelfInfo?,
++    radio: RaumataRadioState?,
++    power: String?,
++) {
+     val text =
+         when (state) {
+             ConnectionState.Disconnected -> "Not connected"
+             ConnectionState.Connecting -> "Connecting…"
+             ConnectionState.Connected -> {
+                 if (selfInfo != null) {
+-                    val keyPrefix = selfInfo.publicKey.take(6).toByteArray().toPrefixHex()
+-                    val freqMhz = selfInfo.radioFreqKhz / 1000.0
+-                    val bwKhz = selfInfo.radioBwHz / 1000.0
+-                    "${selfInfo.nodeName} ($keyPrefix) · ${freqMhz} MHz · BW ${bwKhz} kHz · SF${selfInfo.radioSf} · CR4/${selfInfo.radioCr}"
++                    val keyPrefix = selfInfo.publicKey.take(12)
++                    val profile =
++                        radio?.let { state ->
++                            val name = state.profileName.ifBlank { "profile ${state.profileId ?: "?"}" }
++                            val sync = if (state.syncHex.isBlank()) "" else " · sync 0x${state.syncHex}"
++                            "$name$sync"
++                        }
++                            ?: "${selfInfo.radioFrequency} MHz · BW ${selfInfo.radioBandwidth} kHz · SF${selfInfo.radioSpreadingFactor} · CR4/${selfInfo.radioCodingRate}"
++                    val battery = power?.let { " · $it" }.orEmpty()
++                    "${selfInfo.deviceName} ($keyPrefix) · $profile$battery"
+                 } else {
+                     "Connected"
+                 }
+@@ -293,11 +304,10 @@ private fun RadioModeCard(
+     Card(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+         Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+             Text("Radio mode", style = MaterialTheme.typography.titleMedium)
+-            if (mode == null) {
+-                Text("This node did not report a Raumata operating mode.")
+-                return@Column
+-            }
+-            Text(mode.summary, style = MaterialTheme.typography.bodySmall)
++            Text(
++                mode?.summary ?: "Choose how this radio is shared. The node will apply it when you select a mode.",
++                style = MaterialTheme.typography.bodySmall,
++            )
+             Row(
+                 modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                 horizontalArrangement = Arrangement.spacedBy(8.dp),
+@@ -310,19 +320,23 @@ private fun RadioModeCard(
+                     )
+                 }
+             }
+-            val activeName = radio.profileName.ifBlank { "Profile ${radio.profileId ?: "?"}" }
+-            val sync = if (radio.syncHex.isBlank()) "" else " · sync 0x${radio.syncHex}"
+-            Text("$activeName$sync", style = MaterialTheme.typography.bodyMedium)
+-            Row(
+-                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+-            ) {
+-                phyPresets.filter { it.family == mode.family }.forEach { preset ->
+-                    FilterChip(
+-                        selected = preset.id == radio.profileId,
+-                        onClick = { onProfile(preset.id) },
+-                        label = { Text(preset.name) },
+-                    )
++            if (radio != null && mode != null) {
++                val activeName = radio.profileName.ifBlank { "Profile ${radio.profileId ?: "?"}" }
++                val sync = if (radio.syncHex.isBlank()) "" else " · sync 0x${radio.syncHex}"
++                Text("$activeName$sync", style = MaterialTheme.typography.bodyMedium)
++            }
++            if (mode != null) {
++                Row(
++                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
++                    horizontalArrangement = Arrangement.spacedBy(8.dp),
++                ) {
++                    phyPresets.filter { it.family == mode.family }.forEach { preset ->
++                        FilterChip(
++                            selected = preset.id == radio?.profileId,
++                            onClick = { onProfile(preset.id) },
++                            label = { Text(preset.name) },
++                        )
++                    }
+                 }
+             }
+         }
+@@ -334,7 +348,7 @@ private fun ChatPane(
+     title: String,
+     messages: List<MeshCoreChatMessage>,
+     onBack: () -> Unit,
+-    onSend: (String) -> Unit,
++    onSend: (String, (Boolean) -> Unit) -> Unit,
+ ) {
+     var draft by remember { mutableStateOf("") }
+ 
+@@ -371,8 +385,10 @@ private fun ChatPane(
+             )
+             Button(
+                 onClick = {
+-                    onSend(draft)
+-                    draft = ""
++                    val text = draft
++                    onSend(text) { ok ->
++                        if (ok) draft = ""
++                    }
+                 },
+                 modifier = Modifier.padding(start = 8.dp),
+             ) {

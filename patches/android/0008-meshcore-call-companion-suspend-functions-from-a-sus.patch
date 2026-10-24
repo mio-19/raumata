@@ -1,0 +1,169 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mio <mio@mio19.uk>
+Date: Sat, 24 Oct 2026 18:46:30 +1100
+Subject: [PATCH] meshcore: call companion suspend functions from a suspend
+ context
+
+MeshCoreKmp's connect, send, and radio commands are suspending, so they cannot run inside runCatching.
+
+diff --git a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreRepository.kt b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreRepository.kt
+index 48a7755664ca999dbd5df026d9fceb8e5789b7fa..987f8ac2672ca93043dfb94071ca45aa0b345e2b 100644
+--- a/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreRepository.kt
++++ b/feature/meshcore/src/commonMain/kotlin/org/meshtastic/feature/meshcore/MeshCoreRepository.kt
+@@ -25,6 +25,7 @@ import com.darkrockstudios.libs.meshcore.model.Channel
+ import com.darkrockstudios.libs.meshcore.model.Contact
+ import com.darkrockstudios.libs.meshcore.model.ReceivedMessage
+ import com.darkrockstudios.libs.meshcore.model.SelfInfo
++import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.CoroutineExceptionHandler
+ import kotlinx.coroutines.ExperimentalCoroutinesApi
+@@ -183,7 +184,8 @@ class MeshCoreRepository(
+         val scanner = if (device.transport == MeshCoreTransport.BLE) bleScanner else usbScanner
+         val discovered = DiscoveredDevice(identifier = device.id, name = device.name, rssi = device.rssi)
+ 
+-        runCatching {
++        val connected =
++            catchMesh {
+                 scanner.connect(
+                     device = discovered,
+                     scope = scope,
+@@ -197,20 +199,22 @@ class MeshCoreRepository(
+                         ),
+                 )
+             }
+-            .onSuccess {
+-                connection.value = it
+-                if (messageDeviceId != device.id) {
+-                    _messages.value = emptyList()
+-                    messageDeviceId = device.id
+-                }
+-                _radio.value = null
+-                _power.value = null
+-                // autoFetchContacts is not applied by MeshCoreKmp's initialize().
+-                runCatching { it.getContacts() }
+-                refreshRadio()
+-                refreshPower()
++        val conn =
++            connected.getOrElse {
++                _error.value = it.message ?: "Could not connect to MeshCore device"
++                return
+             }
+-            .onFailure { _error.value = it.message ?: "Could not connect to MeshCore device" }
++        connection.value = conn
++        if (messageDeviceId != device.id) {
++            _messages.value = emptyList()
++            messageDeviceId = device.id
++        }
++        _radio.value = null
++        _power.value = null
++        // autoFetchContacts is not applied by MeshCoreKmp's initialize().
++        catchMesh { conn.getContacts() }
++        refreshRadio()
++        refreshPower()
+     }
+ 
+     suspend fun disconnect() {
+@@ -223,7 +227,7 @@ class MeshCoreRepository(
+     suspend fun sendChannelMessage(channelIndex: Int, text: String): Boolean {
+         val conn = connection.value ?: return false
+         _error.value = null
+-        return runCatching { conn.sendChannelMessage(channelIndex = channelIndex, text = text) }
++        return catchMesh { conn.sendChannelMessage(channelIndex = channelIndex, text = text) }
+             .onSuccess {
+                 _messages.update {
+                     (it +
+@@ -242,7 +246,9 @@ class MeshCoreRepository(
+     suspend fun sendDirectMessage(contact: Contact, text: String): Boolean {
+         val conn = connection.value ?: return false
+         _error.value = null
+-        return runCatching { conn.sendDirectMessage(publicKeyPrefix = contact.publicKeyPrefix.decodePrefixHex(), text = text) }
++        return catchMesh {
++            conn.sendDirectMessage(publicKeyPrefix = contact.publicKeyPrefix.decodePrefixHex(), text = text)
++        }
+             .onSuccess {
+                 _messages.update {
+                     (it +
+@@ -261,14 +267,14 @@ class MeshCoreRepository(
+     suspend fun sendSelfAdvert(flood: Boolean = true) {
+         val conn = connection.value ?: return
+         _error.value = null
+-        runCatching { conn.sendAdvert(flood = flood) }
++        catchMesh { conn.sendAdvert(flood = flood) }
+             .onFailure { _error.value = it.message ?: "Could not send MeshCore advert" }
+     }
+ 
+     suspend fun refresh() {
+         val conn = connection.value ?: return
+         _error.value = null
+-        runCatching {
++        catchMesh {
+                 conn.getAllChannels()
+                 conn.getContacts()
+                 refreshRadio()
+@@ -279,7 +285,7 @@ class MeshCoreRepository(
+ 
+     private suspend fun refreshPower() {
+         val conn = connection.value ?: return
+-        runCatching { conn.getBattery() }
++        catchMesh { conn.getBattery() }
+             .onSuccess { info ->
+                 val storage =
+                     if (info.usedStorageKb != null && info.totalStorageKb != null) {
+@@ -294,7 +300,7 @@ class MeshCoreRepository(
+     suspend fun refreshRadio() {
+         val conn = connection.value ?: return
+         radioMutex.withLock {
+-            runCatching { radioStateFromCustomVars(conn.getCustomVars()) }
++            catchMesh { radioStateFromCustomVars(conn.getCustomVars()) }
+                 .onSuccess { _radio.value = it }
+                 .onFailure { _error.value = it.message ?: "Could not read the radio mode" }
+         }
+@@ -304,8 +310,13 @@ class MeshCoreRepository(
+         val conn = connection.value ?: return
+         _error.value = null
+         radioMutex.withLock {
+-            runCatching { conn.setCustomVar("mode", mode.wire) }
+-                .onSuccess { _radio.value = radioStateFromCustomVars(conn.getCustomVars()) }
++            val wrote = catchMesh { conn.setCustomVar("mode", mode.wire) }
++            if (wrote.isFailure) {
++                _error.value = wrote.exceptionOrNull()?.message ?: "Could not set the operating mode"
++                return@withLock
++            }
++            catchMesh { radioStateFromCustomVars(conn.getCustomVars()) }
++                .onSuccess { _radio.value = it }
+                 .onFailure { _error.value = it.message ?: "Could not set the operating mode" }
+         }
+     }
+@@ -314,8 +325,13 @@ class MeshCoreRepository(
+         val conn = connection.value ?: return
+         _error.value = null
+         radioMutex.withLock {
+-            runCatching { conn.setCustomVar("phy.id", id.toString()) }
+-                .onSuccess { _radio.value = radioStateFromCustomVars(conn.getCustomVars()) }
++            val wrote = catchMesh { conn.setCustomVar("phy.id", id.toString()) }
++            if (wrote.isFailure) {
++                _error.value = wrote.exceptionOrNull()?.message ?: "Could not set the radio profile"
++                return@withLock
++            }
++            catchMesh { radioStateFromCustomVars(conn.getCustomVars()) }
++                .onSuccess { _radio.value = it }
+                 .onFailure { _error.value = it.message ?: "Could not set the radio profile" }
+         }
+     }
+@@ -324,6 +340,15 @@ class MeshCoreRepository(
+         _error.value = null
+     }
+ 
++    private suspend inline fun <T> catchMesh(block: suspend () -> T): Result<T> =
++        try {
++            Result.success(block())
++        } catch (cancelled: CancellationException) {
++            throw cancelled
++        } catch (thrown: Throwable) {
++            Result.failure(thrown)
++        }
++
+     private companion object {
+         const val MAX_MESSAGES = 200
+     }
