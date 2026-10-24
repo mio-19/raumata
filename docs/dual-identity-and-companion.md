@@ -48,11 +48,13 @@ app, and vice versa) is a separate optional bridge described in section 6.
 
 ### MeshCore
 
-- ed25519 keypair stored in NVS as `raumata/mc_id` (64-byte private key, or
-  64-byte private + 32-byte public key).
-- Node name in `raumata/mc_name` (falls back to Meshtastic `owner`).
-- Up to eight channels in `raumata/mc_ch`.
-- `MeshCoreNode` sends an `ADV_TYPE_CHAT` advert on boot and every 15 minutes.
+- ed25519 keypair stored by MeshCore's companion identity store on LittleFS.
+  A key already saved in NVS as `raumata/mc_id` is copied across on first boot.
+- Node name lives in the companion prefs. A new node takes the Meshtastic
+  owner name until the companion sets one. A legacy `raumata/mc_name` is
+  copied once.
+- Channels and contacts live in MeshCore's companion files on LittleFS.
+- `MyMesh` sends an `ADV_TYPE_CHAT` advert on boot and every 15 minutes.
 - MeshCore contacts learn the node from that advert.
 
 ## 4. Identity model
@@ -186,7 +188,7 @@ No new protocol is needed:
 
 ### 5.2 MeshCore presence
 
-- `MeshCoreNode` sends `ADV_TYPE_CHAT` adverts on boot and every 15 minutes.
+- `MyMesh` sends `ADV_TYPE_CHAT` adverts on boot and every 15 minutes.
 - Include latitude/longitude when Meshtastic has a local position. Add a
   small accessor from the Meshtastic NodeDB/position state to the MeshCore
   node.
@@ -307,7 +309,7 @@ a firmware feature. For two apps, use two transports.
 - MeshCore app connects over USB using the MeshCore companion framing.
 - The two paths have independent state:
   - Meshtastic `PhoneAPI`/`BluetoothPhoneAPI` queues and BLE callbacks.
-  - `MeshCoreNode` queue and `CompanionSerial` USB reader/writer.
+  - `MyMesh` offline queue and `CompanionSerial` USB reader/writer.
 - In this mode, do not run the Meshtastic USB PhoneAPI concurrently with the
   MeshCore USB companion. Keep Meshtastic USB for debug or make it a build
   option; USB is owned by `CompanionSerial`.
@@ -367,7 +369,7 @@ own the port. If this mode is retained:
 | Component | State owner | Concurrency |
 | --- | --- | --- |
 | Meshtastic PhoneAPI | `BluetoothPhoneAPI` / `SerialConsole` / `ServerAPI` | Existing per-transport queues and mutexes |
-| MeshCore companion | `MeshCoreNode` + `CompanionSerial` | Main loop; add mutex if BLE callbacks are added |
+| MeshCore companion | `MyMesh` + `CompanionSerial` | Main loop; add mutex if BLE callbacks are added |
 | Radio | `RadioLibInterface` | `rawRadioMutex` and owner flags |
 | Identity/link | `NodeDB` + NVS | Read at boot; update on owner/key changes |
 | Message queues | Per stack | No shared protocol queue |
